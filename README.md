@@ -58,6 +58,13 @@ The first run prints an **access code** and keeps it in `~/.scview/token`. The h
 
 Useful options: `--balance <dollars>` shows your remaining API credit in the headset (an estimate), `--context-confirm` and `--context-max` stop a very large AI request until you say "go on", `--models <folder>` adds a folder to the headset's Models list.
 
+## Without the Claude API, and without any AI
+
+- `--ai ollama` sends voice requests to a local model behind an OpenAI-compatible endpoint (Ollama by default: `--ai-url`, `--ai-model`) instead of the Claude API. No key, no cost. See [docs/local-ai-tier.md](docs/local-ai-tier.md).
+- A request that only sets one parameter or feature dimension ("set thickness to 12", "make the hole 8mm") is done by the server itself, with no AI. `GET /dimensions.txt` lists what can be set and `POST /dimension` sets one, for a slider or a handle in the headset. `--no-direct` turns this off. See [docs/direct-edits.md](docs/direct-edits.md).
+
+Both were built and tested on Linux with text requests and a simulated headset, not yet with a Quest or with speech.
+
 ## Things to know
 
 - The server listens on your local network. The access code stops other devices using it, but the traffic is not encrypted: use it on a network you trust.

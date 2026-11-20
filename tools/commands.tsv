@@ -1,0 +1,31 @@
+edit.undo	Undo the last change	undo|undo that|undo it|undo the last change|go back
+edit.redo	Redo	redo|redo that|redo it
+view.hide	Hide the selected parts	hide|hide this|hide these|hide it|hide them|hide the selection
+view.isolate	Show only the selected parts	isolate|isolate this|isolate these|isolate it|show only this|show only these
+view.show_all	Show every part	show all|show everything|unhide all|unhide everything
+select.clear	Deselect	deselect|deselect all|clear selection|clear the selection|select nothing
+view.recentre	Bring the model back in front	recentre|recenter|bring it back|reset the view
+select.mode	Pick parts, faces or edges	pick faces|pick edges|pick parts
+tool.push_pull	Push or pull a face	push pull|pull
+tool.place	Set the model down on a surface	set down|set it down
+view.size	Step the model's size	size|next size
+view.snap	Stand the model upright	upright|stand it up
+file.save	Save as a new file	save the file|save the design
+tool.section	Section cut	section|section cut|cut view
+tool.measure	Measure	measure
+view.edges	Edges: outline, all, none	edges|toggle edges
+view.explode	Exploded view	explode|exploded view|explode it
+note.add	Pin a voice note	note|add a note
+view.room	Room on or off	room|toggle the room
+file.models	Open another model	models|open a model|open another model
+view.guides	Axes and grid	guides|axes|grid
+ui.keyboard	On-screen keyboard	keyboard
+ai.repeat	Repeat the last request	repeat|repeat that|again|do it again
+ai.keep	Keep the last request	keep that|save that request
+ai.saved	Saved requests	saved requests|show saved requests
+ui.radial	Radial menu at the pointing hand: move towards a choice, trigger to take it	menu|radial menu|open the menu
+tool.clash	Check which parts overlap, and mark them red	check interference|interference|interference check|check for clashes|do any parts overlap|check overlaps
+tool.move	Move a part: drag it, let go on another part's face to set it there	move|move parts|move a part|move this
+edit.handles	Dimension handles on the model: drag one to change its size	handles|dimension handles|show the handles|hide the handles
+edit.features	Feature tree: switch a feature off or on, or edit it	features|feature tree|show the features|timeline
+edit.dimensions	Dimensions: change a size directly	dimensions|show dimensions|show the dimensions

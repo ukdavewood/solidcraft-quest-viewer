@@ -7,18 +7,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
+#[cfg(target_os = "android")]
+use android_activity::{AndroidApp as Host, InputStatus, MainEvent, PollEvent};
+#[cfg(target_os = "android")]
+use android_activity::input::Keycode;
+#[cfg(not(target_os = "android"))]
+mod host;
+#[cfg(not(target_os = "android"))]
+pub use host::Host;
+#[cfg(not(target_os = "android"))]
+use host::Keycode;
 use ash::{
     util::read_spv,
     vk::{self, Handle},
 };
 use openxr as xr;
 
+mod commands;
 mod font;
 mod icons;
 mod panel;
 mod raycast;
 mod scene;
+mod svr;
 mod voice;
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
@@ -38,6 +49,12 @@ const MEASURE_TINT: [f32; 4] = [1.0, 0.85, 0.2, 1.0];
 const HOVER_TINT: [f32; 4] = [0.35, 0.8, 1.0, 0.3];
 const SELECT_TINT: [f32; 4] = [1.0, 0.55, 0.1, 0.25];
 const SELECT_EDGE_TINT: [f32; 4] = [1.0, 0.5, 0.05, 1.0];
+/// The whole model while it is a preview of a change not made yet: clearly green.
+const PREVIEW_TINT: [f32; 4] = [0.2, 0.95, 0.4, 0.55];
+/// Parts the interference check found overlapping.
+const CLASH_TINT: [f32; 4] = [1.0, 0.12, 0.1, 0.6];
+/// The overlap of two parts, shown as a body of its own.
+const OVERLAP_TINT: [f32; 4] = [1.0, 0.05, 0.05, 0.9];
 
 type M4 = [f32; 16];
 
@@ -155,6 +172,37 @@ fn pose_matrix(pose: &xr::Posef) -> M4 {
     mul(&translate(pose.position.x, pose.position.y, pose.position.z), &quat_to_mat(pose.orientation))
 }
 
+/// An OpenXR pose as the shared grab's (svr) pose.
+fn svr_pose(p: &xr::Posef) -> svr::Pose {
+    svr::Pose {
+        position: [p.position.x as f64, p.position.y as f64, p.position.z as f64],
+        orientation: [p.orientation.x as f64, p.orientation.y as f64, p.orientation.z as f64, p.orientation.w as f64],
+    }
+}
+
+/// A model matrix (a turn, one scale and a move) as the shared grab's transform; `None` when it has no scale.
+fn m4_to_transform(m: &M4) -> Option<svr::room::Transform> {
+    let col = |c: usize| [m[c * 4] as f64, m[c * 4 + 1] as f64, m[c * 4 + 2] as f64];
+    let scale = svr::vector::length(col(0));
+    if !(scale.is_finite() && scale > 0.0) {
+        return None;
+    }
+    let axes = [0, 1, 2].map(|c| svr::vector::scale(col(c), 1.0 / svr::vector::length(col(c)).max(1e-30)));
+    svr::room::Transform { axes, scale, translation: col(3), pivot: [0.0; 3] }.tidy()
+}
+
+/// The shared grab's transform as a model matrix.
+fn transform_to_m4(t: &svr::room::Transform) -> M4 {
+    let mut m = identity();
+    for c in 0..3 {
+        for r in 0..3 {
+            m[c * 4 + r] = (t.axes[c][r] * t.scale) as f32;
+        }
+        m[12 + c] = t.translation[c] as f32;
+    }
+    m
+}
+
 /// Asymmetric projection from an OpenXR field of view, Vulkan clip space (y down, depth 0..1).
 fn projection(fov: xr::Fovf, near: f32, far: f32) -> M4 {
     let tl = fov.angle_left.tan();
@@ -211,6 +259,9 @@ struct Mesh {
     indices: Vec<u32>,
     bounds: [f32; 6],
     bodies: Vec<Body>,
+    /// An edit of the model already on show (the server's beacon said so): the view keeps its size and
+    /// place, so what changed is seen to change. False for another model, which is fitted afresh.
+    same_model: bool,
 }
 
 /// One body (an OBJ object from SolidCraft): a contiguous range of the index buffer.
@@ -677,6 +728,12 @@ enum Button {
     Repeat,
     SaveReq,
     Saved,
+    Dims,
+    Features,
+    Handles,
+    Move,
+    Clash,
+    Radial,
     ConfirmGo,
     ConfirmStop,
     CancelVoice,
@@ -690,6 +747,35 @@ enum Guides {
     Off,
     Axes,
     Grid,
+}
+
+/// A long dimensions list is shown in pages: (dimensions on a page, pages). A list that fits has one page; a
+/// longer one gives up its last row to "next page".
+fn dims_paging(total: usize) -> (usize, usize) {
+    if total <= MODELS_SHOWN {
+        (total.max(1), 1)
+    } else {
+        let per = MODELS_SHOWN - 1;
+        (per, total.div_ceil(per))
+    }
+}
+
+/// Width of each of the two targets (- and +) at the right end of a dimension's row.
+const DIM_ZONE: f32 = 0.022;
+
+/// A dimension's value one step down (dir -1) or up (+1): the step is a round number about a tenth of the
+/// value (60 goes by 5, 10 by 1, 6 by 0.5), and the result lands on a multiple of it.
+fn dim_step_to(value: f32, dir: f32) -> f32 {
+    let step = nice_step(value.abs() / 10.0).max(0.01);
+    let k = value / step;
+    let next = if dir > 0.0 { (k + 1e-3).floor() + 1.0 } else { (k - 1e-3).ceil() - 1.0 };
+    (next * step * 1000.0).round() / 1000.0
+}
+
+/// A dimension's value for a row: no trailing zeros.
+fn fmt_dim(v: f32) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// A round grid spacing (1, 2 or 5 times a power of ten) near x.
@@ -706,6 +792,8 @@ enum Overlay {
     Keys,
     Models,
     Requests,
+    Dims,
+    Features,
     Reply,
 }
 
@@ -760,7 +848,7 @@ fn overlay_rows(ov: Overlay, models: usize) -> usize {
     match ov {
         Overlay::Off => 0,
         Overlay::Keys => KEY_HELP.len(),
-        Overlay::Models | Overlay::Requests => models.clamp(1, MODELS_SHOWN),
+        Overlay::Models | Overlay::Requests | Overlay::Dims | Overlay::Features => models.clamp(1, MODELS_SHOWN),
         Overlay::Reply => REPLY_ROWS,
     }
 }
@@ -846,7 +934,20 @@ struct PanelState {
     /// The floating on-screen keyboard is open.
     kb_open: bool,
     /// Which page of the full reply is shown.
+    /// What Undo and Redo would take back or bring back: "" (nothing), "model" (the Mac says what, see
+    /// voice::history), or the words to show.
+    undo_what: &'static str,
+    redo_what: &'static str,
     reply_page: usize,
+    /// The page of the dimensions list, and of the feature tree, on view.
+    dims_page: usize,
+    feat_page: usize,
+    /// The dimension handles are on show.
+    handles: bool,
+    /// The trigger moves parts.
+    moving: bool,
+    /// Overlapping parts are marked.
+    clash: bool,
     overlay: Overlay,
     /// The overlay row the pointer is on.
     overlay_hover: Option<usize>,
@@ -854,18 +955,43 @@ struct PanelState {
 
 /// A button's name: short (beside its icon) or long (the hint when it is pointed at). It says what
 /// pressing the button does next, except for Edges, Guides and Faces, which show what is on now.
+/// A choice's name on the radial menu: what it does, whatever state the tool is in.
+fn radial_label(b: Button) -> &'static str {
+    match b {
+        Button::Hide => "Hide",
+        Button::Isolate => "Isolate",
+        Button::ShowAll => "Show all",
+        Button::Clear => "Deselect",
+        Button::Recentre => "Recentre",
+        Button::Undo => "Undo",
+        Button::Redo => "Redo",
+        Button::Section => "Section",
+        Button::Measure => "Measure",
+        Button::Explode => "Explode",
+        Button::Note => "Note",
+        Button::Faces => "Parts/faces",
+        Button::PushPull => "Push/pull",
+        Button::Size => "Size",
+        Button::Models => "Models",
+        Button::Dims => "Dimensions",
+        Button::Handles => "Handles",
+        Button::Move => "Move",
+        Button::Clash => "Overlaps",
+        _ => "?",
+    }
+}
+
 fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
     let PanelState { room_off, section, measuring, edges, exploded, noting, faces, pick_edges, pushing, placing, size_idx, guides, overlay, .. } = *st;
     let sel = st.notes_selected > 0;
     match b {
         Button::Tab(t) => t.label(),
-        Button::ConfirmGo => {
-            if short {
-                "Go on"
-            } else {
-                "Go on with the big request"
-            }
-        }
+        Button::ConfirmGo => match (voice::preview(), short) {
+            (true, true) => "Apply",
+            (true, false) => "Apply the change on show",
+            (false, true) => "Go on",
+            (false, false) => "Go on with the big request",
+        },
         Button::Reply => "Read the full reply (click: next page)",
         Button::CancelVoice => {
             if short {
@@ -874,13 +1000,12 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
                 "Cancel the recording: nothing is sent"
             }
         }
-        Button::ConfirmStop => {
-            if short {
-                "Stop"
-            } else {
-                "Stop: do not send the big request"
-            }
-        }
+        Button::ConfirmStop => match (voice::preview(), short) {
+            (true, true) => "Drop",
+            (true, false) => "Drop it: change nothing",
+            (false, true) => "Stop",
+            (false, false) => "Stop: do not send the big request",
+        },
         Button::Repeat => {
             if short {
                 "Repeat"
@@ -895,6 +1020,37 @@ fn label(b: Button, st: &PanelState, short: bool) -> &'static str {
                 "Keep (save) the last request to repeat"
             }
         }
+        Button::Radial => if short { "Menu" } else { "Radial menu at the pointing hand" },
+        Button::Clash => match (st.clash, short) {
+            (true, true) => "No marks",
+            (false, true) => "Overlaps",
+            (true, false) => "Take the red marks off",
+            (false, false) => "Check which parts overlap: they turn red and are selected",
+        },
+        Button::Move => match (st.moving, short) {
+            (true, true) => "Stop move",
+            (false, true) => "Move",
+            (true, false) => "Stop moving parts",
+            (false, false) => "Move a part: drag it; let go on another part's face to set it there",
+        },
+        Button::Handles => match (st.handles, short) {
+            (true, true) => "No handles",
+            (false, true) => "Handles",
+            (true, false) => "Hide the dimension handles",
+            (false, false) => "Dimension handles: drag one on the model to change its size",
+        },
+        Button::Features => match (overlay == Overlay::Features, short) {
+            (true, true) => "Close",
+            (false, true) => "Features",
+            (true, false) => "Close the feature tree",
+            (false, false) => "Feature tree: switch a feature off or on, or edit it",
+        },
+        Button::Dims => match (overlay == Overlay::Dims, short) {
+            (true, true) => "Close",
+            (false, true) => "Dims",
+            (true, false) => "Close the dimensions",
+            (false, false) => "Dimensions: change a size directly (no AI)",
+        },
         Button::Saved => match (overlay == Overlay::Requests, short) {
             (true, true) => "Close",
             (false, true) => "Saved",
@@ -1085,6 +1241,11 @@ fn active(b: Button, st: &PanelState) -> bool {
         Button::Models => st.overlay == Overlay::Models,
         Button::Keys => st.overlay == Overlay::Keys,
         Button::Saved => st.overlay == Overlay::Requests,
+        Button::Dims => st.overlay == Overlay::Dims,
+        Button::Features => st.overlay == Overlay::Features,
+        Button::Handles => st.handles,
+        Button::Move => st.moving,
+        Button::Clash => st.clash,
         Button::Reply => st.overlay == Overlay::Reply,
         Button::Keyboard => st.kb_open,
         Button::Section => st.section == Section::Moving,
@@ -1227,7 +1388,14 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
     if overlay != Overlay::Off {
         let models = voice::MODELS.lock().ok().and_then(|m| m.clone());
         let requests = voice::REQUESTS.lock().ok().and_then(|m| m.clone());
-        let count = if overlay == Overlay::Requests { requests.as_ref().map_or(0, |m| m.len()) } else { models.as_ref().map_or(0, |m| m.len()) };
+        let dims = voice::DIMS.lock().ok().and_then(|m| m.clone());
+        let feats = voice::FEATURES.lock().ok().and_then(|m| m.clone());
+        let count = match overlay {
+            Overlay::Requests => requests.as_ref().map_or(0, |m| m.len()),
+            Overlay::Dims => dims.as_ref().map_or(0, |m| m.len()),
+            Overlay::Features => feats.as_ref().map_or(0, |m| m.len()),
+            _ => models.as_ref().map_or(0, |m| m.len()),
+        };
         let rows = overlay_rows(overlay, count);
         let (y0, h) = (hh + OV_GAP, overlay_h(overlay, rows));
         ui.quad(-hw, y0, hw, y0 + h, 0.0, [28, 34, 46]);
@@ -1238,6 +1406,28 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
         let title = match overlay {
             Overlay::Keys => "Keyboard and mouse".to_string(),
             Overlay::Requests => "Saved requests (click to run, x removes)".to_string(),
+            Overlay::Dims => {
+                let total = dims.as_ref().map_or(0, |d| d.len());
+                let (per, pages) = dims_paging(total);
+                if pages > 1 {
+                    let first = st.dims_page.min(pages - 1) * per;
+                    format!("Dimensions {}-{} of {} (- or + changes one, no AI)", first + 1, (first + per).min(total), total)
+                } else if !voice::dims_of().is_empty() {
+                    format!("Dimensions of {} (- or + changes one, no AI)", voice::dims_of())
+                } else {
+                    "Dimensions (click - or + to change, no AI)".to_string()
+                }
+            }
+            Overlay::Features => {
+                let total = feats.as_ref().map_or(0, |d| d.len());
+                let (per, pages) = dims_paging(total);
+                if pages > 1 {
+                    let first = st.feat_page.min(pages - 1) * per;
+                    format!("Features {}-{} of {} (click one for its sizes, on/off at the right)", first + 1, (first + per).min(total), total)
+                } else {
+                    "Features (click one for its sizes, on/off at the right)".to_string()
+                }
+            }
             Overlay::Reply => format!("Reply, page {}/{} (click: next page, Esc: close)", page + 1, pages),
             _ => "Open a model on the Mac (trigger / click)".to_string(),
         };
@@ -1288,6 +1478,69 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
                 }
                 }
             }
+            Overlay::Features => match &feats {
+                None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) if list.is_empty() => ui.text("This design has no features (an imported model)", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) => {
+                    let (per, pages) = dims_paging(list.len());
+                    let page = st.feat_page.min(pages - 1);
+                    if pages > 1 {
+                        let y = row_top(per);
+                        if overlay_hover == Some(per) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        ui.text_px(&format!("Page {} of {}: click here for the next", page + 1, pages), -hw + 0.01, y - 0.001, 0.001, [150, 170, 190], OV_PICK_FP);
+                    }
+                    for (i, f) in list.iter().skip(page * per).take(per).enumerate() {
+                        let y = row_top(i);
+                        if overlay_hover == Some(i) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        // The target at the right end switches the feature off or on; it says which it is now.
+                        let (word, colour) = if f.off { ("off", [150, 60, 60]) } else { ("on", [40, 110, 70]) };
+                        ui.quad(hw - DIM_ZONE * 2.0, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0006, colour);
+                        ui.text_px(word, hw - DIM_ZONE * 1.4, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        let kind = if f.error.is_empty() { f.kind.clone() } else { format!("{} (failing)", f.kind) };
+                        let kw = Ui::text_width_px(&kind, OV_PICK_FP);
+                        let right = hw - DIM_ZONE * 2.0 - 0.006;
+                        let name_colour = if f.off { [110, 125, 145] } else if f.error.is_empty() { [235, 240, 250] } else { [240, 150, 80] };
+                        ui.text_px(&Ui::fit(&f.name, (right + hw - 0.02 - kw) * FONT_PX / OV_PICK_FP), -hw + 0.01, y - 0.001, 0.001, name_colour, OV_PICK_FP);
+                        ui.text_px(&kind, right - kw, y - 0.001, 0.001, [150, 170, 190], OV_PICK_FP);
+                    }
+                }
+            },
+            Overlay::Dims => match &dims {
+                None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) if list.is_empty() => ui.text("Nothing to set: the design has no parameters or features", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
+                Some(list) => {
+                    let (per, pages) = dims_paging(list.len());
+                    let page = st.dims_page.min(pages - 1);
+                    if pages > 1 {
+                        // The last row turns the page.
+                        let y = row_top(per);
+                        if overlay_hover == Some(per) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        ui.text_px(&format!("Page {} of {}: click here for the next", page + 1, pages), -hw + 0.01, y - 0.001, 0.001, [150, 170, 190], OV_PICK_FP);
+                    }
+                    for (i, d) in list.iter().skip(page * per).take(per).enumerate() {
+                        let y = row_top(i);
+                        if overlay_hover == Some(i) {
+                            ui.quad(-hw + 0.004, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0005, [70, 150, 220]);
+                        }
+                        // The two targets at the right end: one step down, one step up.
+                        ui.quad(hw - DIM_ZONE * 2.0, y - OV_PICK_HIT, hw - DIM_ZONE - 0.002, y + 0.0005, 0.0006, [60, 72, 92]);
+                        ui.quad(hw - DIM_ZONE, y - OV_PICK_HIT, hw - 0.004, y + 0.0005, 0.0006, [60, 72, 92]);
+                        ui.text_px("-", hw - DIM_ZONE * 1.5 - 0.003, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        ui.text_px("+", hw - DIM_ZONE * 0.5 - 0.004, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        let value = format!("{} {}", fmt_dim(d.value), d.unit);
+                        let vw = Ui::text_width_px(&value, OV_PICK_FP);
+                        let right = hw - DIM_ZONE * 2.0 - 0.006;
+                        ui.text_px(&Ui::fit(&d.label, (right + hw - 0.02 - vw) * FONT_PX / OV_PICK_FP), -hw + 0.01, y - 0.001, 0.001, [235, 240, 250], OV_PICK_FP);
+                        ui.text_px(&value, right - vw, y - 0.001, 0.001, [140, 240, 150], OV_PICK_FP);
+                    }
+                }
+            },
             _ => match &models {
                 None => ui.text("Asking the Mac...", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
                 Some(list) if list.is_empty() => ui.text("No models found on the Mac", -hw + 0.01, row_top(0) - 0.001, 0.001, [150, 170, 190]),
@@ -1310,6 +1563,16 @@ fn build_panel(title: &str, subtitle: &str, st: &PanelState, lay: &panel::Layout
     // The title; the second line is the name and shortcut of the button pointed at, else the subtitle.
     let hint = hover.map(|b| {
         let key = panel::shortcut(b);
+        // Undo and Redo say what they would do.
+        let what = match b {
+            Button::Undo => Some(("Undo", st.undo_what, voice::history().0)),
+            Button::Redo => Some(("Redo", st.redo_what, voice::history().1)),
+            _ => None,
+        };
+        if let Some((verb, what, from_mac)) = what.filter(|w| !w.1.is_empty()) {
+            let what = if what == "model" && !from_mac.is_empty() { from_mac } else if what == "model" { "the last change".to_string() } else { what.to_string() };
+            return format!("{verb}: {what}  [{key}]");
+        }
         if key.is_empty() {
             label(b, st, false).to_string()
         } else {
@@ -1561,7 +1824,7 @@ fn ray_box_mesh() -> (Vec<u8>, Vec<u32>) {
 const VERTEX_SIZE: usize = 28;
 
 /// The folders the model files are looked for in.
-fn data_dirs(app: &AndroidApp) -> Vec<std::path::PathBuf> {
+fn data_dirs(app: &Host) -> Vec<std::path::PathBuf> {
     [app.external_data_path(), app.internal_data_path()].into_iter().flatten().collect()
 }
 
@@ -1609,11 +1872,11 @@ fn parse_scm(b: &[u8]) -> Result<Mesh, String> {
     if bodies.is_empty() {
         bodies.push(Body { name: "model".into(), first: 0, count: ni as u32, aabb: [0.0; 6] });
     }
-    Ok(Mesh { verts: b[vstart..istart].to_vec(), indices, bounds, bodies })
+    Ok(Mesh { verts: b[vstart..istart].to_vec(), indices, bounds, bodies, same_model: false })
 }
 
 /// Reads `sea.scm` from the app's files folder (pushed by adb, or saved from the last Wi-Fi download).
-fn load_scm(app: &AndroidApp) -> Option<Mesh> {
+fn load_scm(app: &Host) -> Option<Mesh> {
     for d in data_dirs(app) {
         let path = d.join("sea.scm");
         let Ok(b) = std::fs::read(&path) else { continue };
@@ -1630,9 +1893,14 @@ fn load_scm(app: &AndroidApp) -> Option<Mesh> {
 
 /// Model scale and centring: Z-up model units to Y-up metres, longest side 1.6 m, centred on the origin.
 fn model_inner(bounds: &[f32; 6]) -> M4 {
-    let size = (0..3).map(|k| bounds[k + 3] - bounds[k]).fold(1e-6f32, f32::max);
+    let size = longest_side(bounds);
     let c = |k: usize| (bounds[k] + bounds[k + 3]) * 0.5;
     mul(&mul(&scale(1.6 / size), &z_up_to_y_up()), &translate(-c(0), -c(1), -c(2)))
+}
+
+/// The longest side of a box of bounds, in model units (never zero).
+fn longest_side(bounds: &[f32; 6]) -> f32 {
+    (0..3).map(|k| bounds[k + 3] - bounds[k]).fold(1e-6f32, f32::max)
 }
 
 const BEACON_PORT: u16 = 47800;
@@ -1692,6 +1960,7 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
     };
     log::info!("listening for the Mac on UDP {BEACON_PORT}");
     let mut loaded: Option<(std::net::IpAddr, String)> = None;
+    let mut shown_model: Option<(std::net::IpAddr, String)> = None;
     // The notes version (the beacon's 4th field) last fetched.
     let mut notes_loaded: Option<(std::net::IpAddr, String)> = None;
     let mut buf = [0u8; 256];
@@ -1729,6 +1998,12 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
         if let Some(b) = parts.next() {
             voice::set_spend(b.strip_prefix('b').unwrap_or(""));
         }
+        // The 6th field: p1 while the model on show is a preview of a change not made yet.
+        if let Some(p) = parts.next() {
+            voice::set_preview(p == "p1");
+        }
+        // The 7th field: m and a name for the model, the same through all its edits ("-" or absent: not said).
+        let model_id = parts.next().and_then(|m| m.strip_prefix('m')).filter(|m| *m != "-").map(|m| (from.ip(), m.to_string()));
         let key = (from.ip(), version.to_string());
         if loaded.as_ref() == Some(&key) {
             continue;
@@ -1737,7 +2012,8 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
         let t = Instant::now();
         let body = http_get(std::net::SocketAddr::new(from.ip(), port), "/model.scm", 30);
         match body.map_err(|e| e.to_string()).and_then(|b| parse_scm(&b).map(|m| (m, b))) {
-            Ok((mesh, bytes)) => {
+            Ok((mut mesh, bytes)) => {
+                mesh.same_model = model_id.is_some() && model_id == shown_model;
                 log::info!("downloaded {} triangles ({} MB) in {} ms", mesh.indices.len() / 3, bytes.len() / 1_000_000, t.elapsed().as_millis());
                 if let Some(d) = &save_dir {
                     let tmp = d.join("sea.scm.part");
@@ -1748,6 +2024,7 @@ fn net_thread(save_dir: Option<std::path::PathBuf>) {
                 // Only count it as loaded when a render loop took it (none while the app is reopening).
                 let sent = NET_TX.lock().ok().and_then(|t| t.as_ref().map(|tx| tx.send(mesh).is_ok())).unwrap_or(false);
                 if sent {
+                    shown_model = model_id;
                     loaded = Some(key);
                 } else {
                     log::info!("no render loop to take the model yet; will fetch it again");
@@ -1781,11 +2058,11 @@ fn stl_mesh(stl: &[u8], tris: usize) -> Mesh {
         }
     }
     let bodies = vec![Body { name: "model".into(), first: 0, count: (tris * 3) as u32, aabb: [0.0; 6] }];
-    Mesh { verts, indices: (0..(tris * 3) as u32).collect(), bounds, bodies }
+    Mesh { verts, indices: (0..(tris * 3) as u32).collect(), bounds, bodies, same_model: false }
 }
 
 /// Reads a binary STL: returns the file bytes (80-byte header, u32 count, 50-byte records) and the triangle count.
-fn load_stl(app: &AndroidApp) -> Option<(Vec<u8>, usize)> {
+fn load_stl(app: &Host) -> Option<(Vec<u8>, usize)> {
     let mut dirs = Vec::new();
     if let Some(p) = app.external_data_path() {
         dirs.push(p);
@@ -1813,16 +2090,25 @@ fn load_stl(app: &AndroidApp) -> Option<(Vec<u8>, usize)> {
 /// runtime fills logcat so fast that events from a few minutes ago are gone. Pull it with
 /// `adb pull /sdcard/Android/data/org.scview.viewer/files/scview.log`.
 struct FileLogger {
+    #[cfg(target_os = "android")]
     android: android_logger::AndroidLogger,
     file: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 impl log::Log for FileLogger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        self.android.enabled(m)
+        #[cfg(target_os = "android")]
+        return self.android.enabled(m);
+        #[cfg(not(target_os = "android"))]
+        return m.level() <= log::Level::Info;
     }
     fn log(&self, r: &log::Record) {
+        #[cfg(target_os = "android")]
         self.android.log(r);
+        #[cfg(not(target_os = "android"))]
+        if self.enabled(r.metadata()) {
+            eprintln!("[{}] {}", r.level(), r.args());
+        }
         if let Ok(mut guard) = self.file.lock() {
             if let Some(f) = guard.as_mut() {
                 use std::io::Write;
@@ -1853,14 +2139,15 @@ struct Mouse {
 
 /// A key pressed on the keyboard: its code, the character it types, and Ctrl / Shift.
 struct KeyPress {
-    code: android_activity::input::Keycode,
+    code: Keycode,
     ch: Option<char>,
     ctrl: bool,
     shift: bool,
 }
 
 /// Takes one input event into the mouse state or the key list.
-fn read_input(app: &AndroidApp, ev: &android_activity::input::InputEvent, mouse: &mut Mouse, keys: &mut Vec<KeyPress>) {
+#[cfg(target_os = "android")]
+fn read_input(app: &Host, ev: &android_activity::input::InputEvent, mouse: &mut Mouse, keys: &mut Vec<KeyPress>) {
     use android_activity::input::{Axis, InputEvent, KeyAction, KeyMapChar, MotionAction, Source};
     match ev {
         InputEvent::KeyEvent(k) if k.action() == KeyAction::Down => {
@@ -1901,7 +2188,11 @@ fn read_input(app: &AndroidApp, ev: &android_activity::input::InputEvent, mouse:
 }
 
 /// Asks Android for the permissions the app needs (the microphone, and the room scan) that it does not have yet.
-fn request_permissions(app: &AndroidApp) {
+#[cfg(not(target_os = "android"))]
+fn request_permissions(_app: &Host) {}
+
+#[cfg(target_os = "android")]
+fn request_permissions(app: &Host) {
     use jni_sys::{jobject, jvalue, JNIEnv, JavaVM, JNI_OK};
     // SAFETY: plain JNI calls on the activity object android-activity gives us; local references
     // are dropped before returning, and any Java exception is cleared.
@@ -1969,7 +2260,11 @@ fn request_permissions(app: &AndroidApp) {
 
 /// Asks Android for the mouse (pointer capture, `on`) or gives it back. Captured, it cannot leave the
 /// app's window and every move arrives as a relative event. Only works while the app has focus.
-fn pointer_capture(app: &AndroidApp, on: bool) {
+#[cfg(not(target_os = "android"))]
+fn pointer_capture(_app: &Host, _on: bool) {}
+
+#[cfg(target_os = "android")]
+fn pointer_capture(app: &Host, on: bool) {
     use jni_sys::{jobject, jvalue, JNIEnv, JavaVM, JNI_OK};
     // SAFETY: plain JNI calls on the activity object android-activity gives us; local references
     // are dropped before returning, and any Java exception is cleared.
@@ -2027,7 +2322,7 @@ fn pointer_capture(app: &AndroidApp, on: bool) {
     }
 }
 
-fn init_logging(app: &AndroidApp) {
+fn init_logging(app: &Host) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let file = data_dirs(app).into_iter().next().and_then(|d| {
@@ -2039,6 +2334,7 @@ fn init_logging(app: &AndroidApp) {
             std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
         });
         let logger = FileLogger {
+            #[cfg(target_os = "android")]
             android: android_logger::AndroidLogger::new(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("SCVIEW")),
             file: std::sync::Mutex::new(file),
         };
@@ -2048,8 +2344,9 @@ fn init_logging(app: &AndroidApp) {
     });
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
-fn android_main(app: AndroidApp) {
+fn android_main(app: Host) {
     init_logging(&app);
     log::info!("--- start (UTC times) ---");
     std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
@@ -2057,7 +2354,19 @@ fn android_main(app: AndroidApp) {
     log::info!("exiting");
 }
 
-fn run(app: &AndroidApp) {
+/// The desktop entry point (`scview-desktop`): the same app on Linux, against the OpenXR runtime
+/// chosen by `XR_RUNTIME_JSON` (Monado's simulated headset for development without a Quest).
+#[cfg(not(target_os = "android"))]
+pub fn desktop_main() {
+    let host = Host::new();
+    init_logging(&host);
+    log::info!("--- start, desktop (UTC times); files in {:?} ---", host.external_data_path());
+    std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
+    run(&host);
+    log::info!("exiting");
+}
+
+fn run(app: &Host) {
     // The model: sea.scm (coloured), else a binary STL, else one triangle.
     let mesh = load_scm(app).unwrap_or_else(|| {
         let (stl, tris) = load_stl(app).unwrap_or_else(|| {
@@ -2080,12 +2389,16 @@ fn run(app: &AndroidApp) {
     }
 
     let entry = unsafe { xr::Entry::load().expect("OpenXR loader (libopenxr_loader.so) not found") };
+    #[cfg(target_os = "android")]
     entry.initialize_android_loader().unwrap();
     let available = entry.enumerate_extensions().unwrap();
     assert!(available.khr_vulkan_enable2);
     let mut enabled = xr::ExtensionSet::default();
     enabled.khr_vulkan_enable2 = true;
-    enabled.khr_android_create_instance = true;
+    #[cfg(target_os = "android")]
+    {
+        enabled.khr_android_create_instance = true;
+    }
     // Passthrough (the room seen through the headset cameras) behind the model, where available.
     enabled.fb_passthrough = available.fb_passthrough;
     log::info!("XR_FB_passthrough available: {}", available.fb_passthrough);
@@ -2098,7 +2411,10 @@ fn run(app: &AndroidApp) {
     // cannot tie the app's frames to its window ("non-Activity Context", aperture from "random")
     // and shows its loading scene instead of the app.
     let xr_instance = unsafe {
+        #[cfg(target_os = "android")]
         let mut names: Vec<&[u8]> = vec![b"XR_KHR_vulkan_enable2\0", b"XR_KHR_android_create_instance\0"];
+        #[cfg(not(target_os = "android"))]
+        let mut names: Vec<&[u8]> = vec![b"XR_KHR_vulkan_enable2\0"];
         if enabled.fb_passthrough {
             names.push(b"XR_FB_passthrough\0");
         }
@@ -2107,6 +2423,7 @@ fn run(app: &AndroidApp) {
             names.push(b"XR_META_environment_raycast\0");
         }
         let ptrs: Vec<*const std::os::raw::c_char> = names.iter().map(|n| n.as_ptr() as *const _).collect();
+        #[cfg(target_os = "android")]
         let android_info = xr::sys::InstanceCreateInfoAndroidKHR {
             ty: xr::sys::InstanceCreateInfoAndroidKHR::TYPE,
             next: std::ptr::null(),
@@ -2115,7 +2432,10 @@ fn run(app: &AndroidApp) {
         };
         let mut info = xr::sys::InstanceCreateInfo {
             ty: xr::sys::InstanceCreateInfo::TYPE,
+            #[cfg(target_os = "android")]
             next: &android_info as *const _ as *const _,
+            #[cfg(not(target_os = "android"))]
+            next: std::ptr::null(),
             create_flags: Default::default(),
             application_info: xr::sys::ApplicationInfo {
                 application_name: [0; xr::sys::MAX_APPLICATION_NAME_SIZE],
@@ -2349,6 +2669,9 @@ fn run(app: &AndroidApp) {
         let (mut vbuf, mut vmem, mut ibuf, mut imem, mut index_count) = upload_mesh(&mesh);
         log::info!("uploaded {} triangles in {} ms", tris, t.elapsed().as_millis());
         let mut model_inner = model_inner(&mesh.bounds);
+        // Metres per model unit in model_inner. It is kept through the edits of one model, so after an
+        // edit the longest side may no longer be 1.6 m.
+        let mut inner_scale = 1.6 / longest_side(&mesh.bounds);
         let mut scene = Scene::new(mesh);
         log::info!("{} bodies", scene.bodies.len());
         // Edge lines index the model's vertex buffer (never empty: Vulkan buffers need a size).
@@ -2452,6 +2775,14 @@ fn run(app: &AndroidApp) {
             NoteMoved(String, String),
             NoteText(String, String),
         }
+        /// What a step is, for the Undo and Redo hints.
+        fn step_what(s: &UndoStep) -> &'static str {
+            match s {
+                UndoStep::Visibility(_) => "show / hide",
+                UndoStep::Model => "model",
+                UndoStep::NoteAdded(_) | UndoStep::NoteDeleted(_) | UndoStep::NoteMoved(..) | UndoStep::NoteText(..) => "a note",
+            }
+        }
         let mut undo: Vec<UndoStep> = Vec::new();
         // Steps undone, for Redo (newest last); any new change clears it.
         let mut redo: Vec<UndoStep> = Vec::new();
@@ -2494,6 +2825,8 @@ fn run(app: &AndroidApp) {
         let stick_click = action_set.create_action::<bool>("stick_click", "Thumbstick click", &hand_paths).unwrap();
         // B (right controller): the AI carries out the note pointed at.
         let b_button = action_set.create_action::<bool>("b_button", "B button", &hand_paths).unwrap();
+        // A short buzz in the pointing hand: a dragged value has reached its limit.
+        let haptic = action_set.create_action::<xr::Haptic>("haptic", "Buzz", &hand_paths).unwrap();
         {
             let p = |s: &str| xr_instance.string_to_path(s).unwrap();
             let bindings = [
@@ -2512,9 +2845,35 @@ fn run(app: &AndroidApp) {
                 xr::Binding::new(&stick_click, p("/user/hand/left/input/thumbstick/click")),
                 xr::Binding::new(&stick_click, p("/user/hand/right/input/thumbstick/click")),
                 xr::Binding::new(&b_button, p("/user/hand/right/input/b/click")),
+                xr::Binding::new(&haptic, p("/user/hand/right/output/haptic")),
             ];
             if let Err(e) = xr_instance.suggest_interaction_profile_bindings(p("/interaction_profiles/oculus/touch_controller"), &bindings) {
                 log::info!("controller bindings: {e:?}");
+            }
+            // Desktop: Monado's keyboard-and-mouse controllers are Mixed Reality controllers (no A, B, X, Y):
+            // the menu button recentres.
+            #[cfg(not(target_os = "android"))]
+            {
+                let wmr = [
+                    xr::Binding::new(&grip_pose, p("/user/hand/left/input/grip/pose")),
+                    xr::Binding::new(&grip_pose, p("/user/hand/right/input/grip/pose")),
+                    xr::Binding::new(&squeeze, p("/user/hand/left/input/squeeze/click")),
+                    xr::Binding::new(&squeeze, p("/user/hand/right/input/squeeze/click")),
+                    xr::Binding::new(&stick, p("/user/hand/left/input/thumbstick")),
+                    xr::Binding::new(&stick, p("/user/hand/right/input/thumbstick")),
+                    xr::Binding::new(&recentre, p("/user/hand/left/input/menu/click")),
+                    xr::Binding::new(&recentre, p("/user/hand/right/input/menu/click")),
+                    xr::Binding::new(&aim_pose, p("/user/hand/left/input/aim/pose")),
+                    xr::Binding::new(&aim_pose, p("/user/hand/right/input/aim/pose")),
+                    xr::Binding::new(&trigger, p("/user/hand/left/input/trigger/value")),
+                    xr::Binding::new(&trigger, p("/user/hand/right/input/trigger/value")),
+                    xr::Binding::new(&stick_click, p("/user/hand/left/input/thumbstick/click")),
+                    xr::Binding::new(&stick_click, p("/user/hand/right/input/thumbstick/click")),
+                    xr::Binding::new(&haptic, p("/user/hand/right/output/haptic")),
+                ];
+                if let Err(e) = xr_instance.suggest_interaction_profile_bindings(p("/interaction_profiles/microsoft/motion_controller"), &wmr) {
+                    log::info!("desktop controller bindings: {e:?}");
+                }
             }
         }
         session.attach_action_sets(&[&action_set]).unwrap();
@@ -2541,6 +2900,38 @@ fn run(app: &AndroidApp) {
         let mut pushing = false;
         let mut overlay = Overlay::Off;
         let mut reply_page = 0usize;
+        let mut dims_page = 0usize;
+        let mut feat_page = 0usize;
+        // Dimension handles: arrows on the model, one for each dimension that has a place there. The trigger
+        // on one takes hold of it; the hand's move along the arrow changes the value (slowly with the grip,
+        // see svr::precise), and letting go sends it to the Mac. The drag: the handle, the drag so far, the
+        // hand's place and the arrow's direction in the room when it began, and the value now.
+        // Moving a part: in this mode the trigger takes hold of the part pointed at and it follows the hand
+        // (slowly with the grip, see svr::precise). Let go over another part and it is set on the face
+        // pointed at there; let go over nothing and it stays where it was moved to. The drag: the part, the
+        // point it was taken by (model units), the hand's place in the room then, and the move so far.
+        let mut moving = false;
+        let mut move_drag: Option<(usize, [f32; 3], [f32; 3], [svr::precise::Drag; 3], [f32; 3])> = None;
+        // The radial menu: opened at the pointing hand by pressing the right thumbstick (or Ctrl+Shift+R, or
+        // saying "menu"). Its choices depend on what is pointed at. Pushing the stick, or moving the hand,
+        // towards a choice marks it; letting the stick go (or the trigger) runs it as that button. The
+        // menu: the hand's pose when it opened, its choices, the one marked, whether the stick opened it,
+        // and what it is a menu for.
+        let mut radial: Option<(M4, Vec<Button>, Option<usize>, bool, &'static str, [f32; 3])> = None;
+        let mut radial_ran = 0u32;
+        // After the menu closes the stick is still pushed for a moment (it was let go of by its click): it
+        // does not turn or size the model until it has been back in the middle.
+        let mut stick_rest = false;
+        let mut handles_on = false;
+        let mut handle_hover: Option<usize>;
+        let mut handle_drag: Option<(usize, svr::precise::Drag, [f32; 3], [f32; 3], f32)> = None;
+        // The id of the handle being dragged. The list is fetched again whenever the model changes (someone
+        // else's edit, an AI change): if the handle at that place in the list is then another one, the drag
+        // is dropped rather than its value sent to the wrong dimension.
+        let mut handle_drag_id = String::new();
+        // The dragged value is at its limit (the hand buzzes once when it gets there).
+        let mut handle_at_limit = false;
+        let mut buzzes = 0u32;
         let mut guides = Guides::Off;
         let mut tab = panel::Tab::Select;
         let mut kb_shift = false;
@@ -2550,11 +2941,16 @@ fn run(app: &AndroidApp) {
         let mut kb_drag: Option<([f32; 2], f32)> = None;
         let mut pp_drag: Option<(u32, usize, [f32; 3], [f32; 3], [f32; 3], [f32; 3], f32)> = None;
         let mut pick_ms_sum = 0.0f64;
-        enum Grab {
-            One { hand: usize, inv_hand0: M4, world0: M4 },
-            Two { mid0: [f32; 3], dist0: f32, world0: M4 },
-        }
-        let mut grab: Option<Grab> = None;
+        // Holding the model: SolidCraft's own world grab (svr::grab), so it handles here as in the desktop
+        // app's VR mode. One grip carries it, both grips scale it about the point between the hands, and
+        // a scale brought near real size snaps to it.
+        let debug_ray = std::env::var_os("SCVIEW_DEBUG_RAY").is_some();
+        let mut debug_ray_n = 0u32;
+        let mut debug_handle_n = 0u32;
+        let mut debug_state_n = 0u32;
+        let mut hidden_sent: Vec<bool> = Vec::new();
+        let mut grab = svr::grab::WorldGrab::default();
+        let mut at_real_size = false;
         // Once the model has been handled it stays where it was put (no more auto-turning).
         let mut world: Option<M4> = None;
         let mut recentre_was = false;
@@ -2596,7 +2992,9 @@ fn run(app: &AndroidApp) {
         let mut exit_requested = false;
         let mut no_render = 0u32;
         let mut total: u64 = 0;
-        let mut resumed = false;
+        // The desktop has no Android lifecycle: always resumed.
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+        let mut resumed = cfg!(not(target_os = "android"));
         let mut ready = false;
 
         request_permissions(app);
@@ -2620,8 +3018,21 @@ fn run(app: &AndroidApp) {
         let mut kb_panel_at: Option<[f32; 3]> = None;
         // Push/pull by mouse: steps so far, and when a wheel-only pull ends.
         let mut pp_acc = 0.0f32;
+        // The drag of a face by hand, from the trigger's press to its release (see svr::precise).
+        let mut pp_precise: Option<svr::precise::Drag> = None;
         let mut pp_wheel_until: Option<Instant> = None;
         'main: loop {
+            #[cfg(not(target_os = "android"))]
+            {
+                if app.quit_requested() {
+                    destroy = true;
+                }
+                (mouse.dx, mouse.dy, mouse.wheel) = (0.0, 0.0, 0.0);
+                for (code, ch, ctrl, shift) in app.take_keys() {
+                    keys.push(KeyPress { code, ch, ctrl, shift });
+                }
+            }
+            #[cfg(target_os = "android")]
             app.poll_events(Some(Duration::ZERO), |e| {
                 match &e {
                     PollEvent::Main(MainEvent::Destroy) => destroy = true,
@@ -2638,8 +3049,13 @@ fn run(app: &AndroidApp) {
             });
             // Input events: the keyboard and mouse (Bluetooth, paired with the headset); everything is
             // read, so the system does not decide the app has stopped responding.
-            (mouse.dx, mouse.dy, mouse.wheel) = (0.0, 0.0, 0.0);
+            #[cfg(target_os = "android")]
+            {
+                (mouse.dx, mouse.dy, mouse.wheel) = (0.0, 0.0, 0.0);
+            }
+            #[cfg(target_os = "android")]
             let mut mouse_seen = false;
+            #[cfg(target_os = "android")]
             if let Ok(mut it) = app.input_events_iter() {
                 while it.next(|ev| {
                     if let android_activity::input::InputEvent::MotionEvent(_) = ev {
@@ -2651,6 +3067,7 @@ fn run(app: &AndroidApp) {
             }
             // The mouse is in use but not ours: ask for it (at most every 2 s).
             // (Not only after a mouse event: none arrive until the app has the mouse.)
+            #[cfg(target_os = "android")]
             let _ = mouse_seen;
             if !mouse.captured && mouse.want_capture && mouse.asked.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) {
                 mouse.asked = Some(Instant::now());
@@ -2676,7 +3093,7 @@ fn run(app: &AndroidApp) {
                             if unfocused_since.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) {
                                 log::info!("focus back after {:.0} s: re-placing the model", unfocused_since.map_or(0.0, |t| t.elapsed().as_secs_f32()));
                                 world = None;
-                                grab = None;
+                                grab.release();
                             }
                             unfocused_since = None;
                         } else if unfocused_since.is_none() {
@@ -2700,7 +3117,7 @@ fn run(app: &AndroidApp) {
                         log::info!("reference space changed: re-placing the model");
                         need_anchor = true;
                         world = None;
-                        grab = None;
+                        grab.release();
                     }
                     other => log::info!("xr event {}", match other { VisibilityMaskChangedKHR(_) => "visibility mask", ReferenceSpaceChangePending(_) => "ref space change", EventsLost(_) => "events lost", InteractionProfileChanged(_) => "interaction profile", _ => "other" }),
                 }
@@ -2854,46 +3271,40 @@ fn run(app: &AndroidApp) {
                 held[h] = hand[h].is_some() && squeeze.state(&session, hand_paths[h]).map(|st| st.current_state > 0.6).unwrap_or(false);
             }
             let pos = |p: &xr::Posef| [p.position.x, p.position.y, p.position.z];
-            match (held[0], held[1], hand[0], hand[1]) {
-                (true, true, Some(a), Some(b)) => {
-                    let (pa, pb) = (pos(&a), pos(&b));
-                    let mid = [(pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0, (pa[2] + pb[2]) / 2.0];
-                    let dist = ((pa[0] - pb[0]).powi(2) + (pa[1] - pb[1]).powi(2) + (pa[2] - pb[2]).powi(2)).sqrt().max(0.01);
-                    match &grab {
-                        Some(Grab::Two { mid0, dist0, world0 }) => {
-                            let k = dist / dist0;
-                            world = Some(mul(&translate(mid[0], mid[1], mid[2]), &mul(&scale(k), &mul(&translate(-mid0[0], -mid0[1], -mid0[2]), world0))));
-                        }
-                        _ => grab = Some(Grab::Two { mid0: mid, dist0: dist, world0: cur }),
+            // A hand that is dragging something (a face) does not also hold the model: its grip means "slowly".
+            let grips = [0, 1].map(|h| if held[h] && !(h == 1 && (pp_drag.is_some() || handle_drag.is_some() || move_drag.is_some())) { hand[h].map(|p| svr_pose(&p)) } else { None });
+            if grips.iter().any(Option::is_some) {
+                // The whole model matrix (model units to the room's metres) is what the hands hold; the
+                // viewer keeps it as world * model_inner, so the result is taken apart again.
+                if let Some(full) = m4_to_transform(&mul(&cur, &model_inner)) {
+                    let moved = grab.update(&full, grips);
+                    if moved != full {
+                        world = Some(mul(&transform_to_m4(&moved), &invert(&model_inner)));
                     }
-                }
-                _ => {
-                    let one = if held[1] { Some(1) } else if held[0] { Some(0) } else { None };
-                    match one {
-                        Some(h) => {
-                            if let Some(pose) = hand[h] {
-                                match &grab {
-                                    Some(Grab::One { hand: gh, inv_hand0, world0 }) if *gh == h => {
-                                        world = Some(mul(&pose_matrix(&pose), &mul(inv_hand0, world0)));
-                                    }
-                                    _ => grab = Some(Grab::One { hand: h, inv_hand0: view_matrix(&pose), world0: cur }),
-                                }
-                            }
-                        }
-                        None => grab = None,
+                    let real = moved.scale == svr::room::REAL_SIZE;
+                    if real && !at_real_size && held[0] && held[1] {
+                        log::info!("grab: snapped to real size");
+                        voice::say("Real size (1:1).");
                     }
+                    at_real_size = real;
                 }
+            } else {
+                grab.release();
             }
-            let mode = match &grab {
-                None => "none".to_string(),
-                Some(Grab::One { hand: h, .. }) => format!("one ({})", if *h == 0 { "left" } else { "right" }),
-                Some(Grab::Two { .. }) => "two".to_string(),
+            let mode = match (grab.holding(), held[0], held[1]) {
+                (false, ..) => "none".to_string(),
+                (true, true, true) => "two".to_string(),
+                (true, l, _) => format!("one ({})", if l { "left" } else { "right" }),
             };
             if mode != grab_mode {
                 log::info!("grab {mode}; held L {} R {}, tracked L {} R {}", held[0], held[1], hand[0].is_some(), hand[1].is_some());
                 grab_mode = mode;
             }
-            if grab.is_none() {
+            if stick_rest {
+                let v = stick.state(&session, hand_paths[1]).map(|st| st.current_state).unwrap_or(xr::Vector2f { x: 0.0, y: 0.0 });
+                stick_rest = v.x.abs() > 0.2 || v.y.abs() > 0.2;
+            }
+            if !grab.holding() && radial.is_none() && !stick_rest {
                 if let Ok(st) = stick.state(&session, hand_paths[1]) {
                     let v = st.current_state;
                     if st.is_active && (v.x.abs() > 0.2 || v.y.abs() > 0.2) {
@@ -2931,7 +3342,7 @@ fn run(app: &AndroidApp) {
             }
             // Mouse: right-button drag turns the model about its centre (left/right about the vertical,
             // up/down tips it towards the wearer); the wheel zooms, except in push/pull, where it pulls a face.
-            if grab.is_none() && !views.is_empty() {
+            if !grab.holding() && !views.is_empty() {
                 let base = world.unwrap_or(cur);
                 let c = [base[12], base[13], base[14]];
                 let about_c = |m: &M4| mul(&translate(c[0], c[1], c[2]), &mul(m, &translate(-c[0], -c[1], -c[2])));
@@ -2946,8 +3357,11 @@ fn run(app: &AndroidApp) {
             }
             let pressed = hand_paths.iter().any(|&h| recentre.state(&session, h).map(|st| st.current_state).unwrap_or(false));
             if pressed && !recentre_was {
+                // Fitted afresh to the model as it is now (edits kept the view's size and place).
+                model_inner = crate::model_inner(&scene.bounds());
+                inner_scale = 1.6 / longest_side(&scene.bounds());
                 world = None;
-                grab = None;
+                grab.release();
                 need_anchor = true;
                 anchor = None;
                 anchor_saved = None;
@@ -2967,7 +3381,7 @@ fn run(app: &AndroidApp) {
                 let w = mul(&pm, rel);
                 world = Some(w);
                 last_anchor_world = Some(w);
-                if grab.is_none() && anchor_saved != Some(*rel) && anchor_save_at.elapsed() > Duration::from_secs(2) {
+                if !grab.holding() && anchor_saved != Some(*rel) && anchor_save_at.elapsed() > Duration::from_secs(2) {
                     if let Some(f) = &placement_file {
                         scene::save_placement(f, rel);
                     }
@@ -2984,7 +3398,12 @@ fn run(app: &AndroidApp) {
                 vk_device.destroy_buffer(ibuf, None);
                 vk_device.free_memory(imem, None);
                 (vbuf, vmem, ibuf, imem, index_count) = upload_mesh(&m);
-                model_inner = crate::model_inner(&m.bounds);
+                // An edit keeps the view's size and place: a plate made twice as long is seen to grow, where
+                // fitting it afresh would show it half as thick. Another model is fitted afresh.
+                if !m.same_model {
+                    model_inner = crate::model_inner(&m.bounds);
+                    inner_scale = 1.6 / longest_side(&m.bounds);
+                }
                 tris = m.indices.len() / 3;
                 // Keep what was hidden and selected, by body name (an AI change rebuilds the mesh).
                 let (was_hidden, was_selected) = (names_where(&scene, &hidden), names_where(&scene, &selected));
@@ -2994,11 +3413,25 @@ fn run(app: &AndroidApp) {
                 (ebuf, emem) = upload_edges(&scene);
                 hidden = flags_for(&scene, &was_hidden);
                 selected = flags_for(&scene, &was_selected);
+                // A part or face held by its number in the old mesh may be another one in the new: a move or a
+                // push/pull in progress is dropped, not sent for the wrong part.
+                if move_drag.take().is_some() | pp_drag.take().is_some() {
+                    log::info!("drag dropped: the model changed under it");
+                    voice::say("The model changed, so that drag was dropped.");
+                }
                 // Face numbers change with the mesh: the face selection does not carry over.
                 selected_faces.clear();
                 selected_edges.clear();
                 edge_cache = None;
                 log::info!("new model: {tris} triangles uploaded in {} ms", t.elapsed().as_millis());
+                voice::fetch_history();
+                voice::fetch_explodes();
+                voice::fetch_handles();
+                // The mesh that follows a check carries the overlaps as bodies of their own: the marks stay
+                // with it. Any other new mesh means the design changed, and the check no longer holds.
+                if !scene.bodies.iter().any(|b| b.name.starts_with("Overlap ")) {
+                    voice::clear_clash();
+                }
             }
             let model = mul(&world.unwrap_or_else(|| mul(&place, &rot_y(angle))), &model_inner);
             if let Some(target) = explode_target {
@@ -3009,12 +3442,22 @@ fn run(app: &AndroidApp) {
                 }
             }
             // Each body's move away from the model's centre (model units); empty when assembled.
+            let clash_names: Vec<String> = voice::CLASH.lock().map(|c| c.clone()).unwrap_or_default();
             let offsets: Vec<[f32; 3]> = if explode > 0.0 {
                 let bb = scene.bounds();
                 let c = [0, 1, 2].map(|k| (bb[k] + bb[k + 3]) * 0.5);
                 scene.bodies.iter().map(|b| [0, 1, 2].map(|k| ((b.aabb[k] + b.aabb[k + 3]) * 0.5 - c[k]) * explode)).collect()
             } else {
                 Vec::new()
+            };
+            // A part being moved is drawn (and picked) where the hand has taken it.
+            let offsets = match &move_drag {
+                Some((b, _, _, _, by)) if *b < scene.bodies.len() => {
+                    let mut o = if offsets.is_empty() { vec![[0.0f32; 3]; scene.bodies.len()] } else { offsets };
+                    o[*b] = [0, 1, 2].map(|k| o[*b][k] + by[k]);
+                    o
+                }
+                _ => offsets,
             };
             let off = |b: usize| offsets.get(b).copied().unwrap_or([0.0; 3]);
 
@@ -3095,13 +3538,20 @@ fn run(app: &AndroidApp) {
             let mut overlay_hover: Option<usize> = None;
             let mut overlay_del = false;
             let mut overlay_click = false;
+            let mut overlay_x = 0.0f32;
             let n_models = if overlay == Overlay::Requests {
                 voice::REQUESTS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
+            } else if overlay == Overlay::Features {
+                voice::FEATURES.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
+            } else if overlay == Overlay::Dims {
+                voice::DIMS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
             } else {
                 voice::MODELS.lock().ok().and_then(|m| m.as_ref().map(|l| l.len())).unwrap_or(0)
             };
             let ov_rows = overlay_rows(overlay, n_models);
-            let ctrl_pm: Option<M4> = if held[1] {
+            // No pointer from a hand that holds the model; a hand that is dragging a face keeps it (its grip
+            // then means "slowly").
+            let ctrl_pm: Option<M4> = if held[1] && pp_drag.is_none() && handle_drag.is_none() && move_drag.is_none() {
                 None
             } else {
                 aim_space
@@ -3181,6 +3631,19 @@ fn run(app: &AndroidApp) {
                             if d[2] < -1e-4 {
                                 let t = -o[2] / d[2];
                                 let (x, y) = (o[0] + t * d[0], o[1] + t * d[1]);
+                                // For tests without a headset (SCVIEW_DEBUG_RAY=1): where the pointer's ray meets the
+                                // panel's plane, so a script can steer a simulated controller onto a button.
+                                if debug_ray {
+                                    debug_ray_n = debug_ray_n.wrapping_add(1);
+                                    if debug_ray_n % 6 == 0 {
+                                        log::info!("PANELRAY x {x:.4} y {y:.4} t {t:.3} h {:.4} row {:?} btn {:?}", lay.h, overlay_row_at(overlay, y, ov_rows, lay.h), panel::button_at(&lay, x, y));
+                                    }
+                                    // Now and then, where each button is (its middle), so a script can aim at one by name.
+                                    if debug_ray_n % 90 == 1 {
+                                        let slots: Vec<String> = lay.slots.iter().map(|s| format!("{:?}@{:.4},{:.4}", s.b, s.x + s.w / 2.0, s.top - s.h / 2.0)).collect();
+                                        log::info!("PANELSLOTS {}", slots.join(";"));
+                                    }
+                                }
                                 if t > 0.0 && x.abs() <= PANEL_W / 2.0 && y.abs() <= lay.h / 2.0 {
                                     on_panel = true;
                                     hover_btn = panel::button_at(&lay, x, y);
@@ -3190,8 +3653,9 @@ fn run(app: &AndroidApp) {
                                     on_panel = true;
                                     overlay_click = true;
                                     len = t;
-                                    if matches!(overlay, Overlay::Models | Overlay::Requests) && n_models > 0 {
+                                    if matches!(overlay, Overlay::Models | Overlay::Requests | Overlay::Dims | Overlay::Features) && n_models > 0 {
                                         overlay_hover = overlay_row_at(overlay, y, ov_rows, lay.h);
+                                        overlay_x = x;
                                         overlay_del = overlay == Overlay::Requests && x > PANEL_W / 2.0 - 0.025;
                                     }
                                 }
@@ -3202,8 +3666,24 @@ fn run(app: &AndroidApp) {
                             let t0 = Instant::now();
                             // d is the world unit direction mapped into the model, so t is in metres.
                             let (o_m, d_m) = (transform(&inv, o_w, 1.0), transform(&inv, d_w, 0.0));
-                            let hit = scene.pick(o_m, d_m, &hidden, cut, &offsets);
+                            // The pointer looks past a part that is being moved, to what it would be set on.
+                            let moving_hidden;
+                            let pickable = match &move_drag {
+                                Some((b, ..)) if *b < hidden.len() => {
+                                    moving_hidden = {
+                                        let mut h = hidden.clone();
+                                        h[*b] = true;
+                                        h
+                                    };
+                                    &moving_hidden
+                                }
+                                _ => &hidden,
+                            };
+                            let hit = scene.pick(o_m, d_m, pickable, cut, &offsets);
                             pick_ms_sum += t0.elapsed().as_secs_f64() * 1000.0;
+                            // While a dimension handle is held the ray is the handle's: the parts it passes over
+                            // are not lit up and the panel's title does not change.
+                            let hit = if handle_drag.is_some() { None } else { hit };
                             hovered = hit.map(|(b, _, _)| b);
                             if let Some((_, _, tri)) = hit {
                                 hovered_face = Some(scene.tri_patch[tri]);
@@ -3345,38 +3825,11 @@ fn run(app: &AndroidApp) {
             // typed gives the mouse back to the system.
             let mut key_btn: Option<Button> = None;
             for k in keys.drain(..) {
-                use android_activity::input::Keycode as K;
+                use crate::Keycode as K;
                 let Ok(mut typed) = voice::TYPED.lock() else { continue };
                 if k.ctrl {
-                    key_btn = match k.code {
-                        K::Z if k.shift => Some(Button::Redo),
-                        K::Z => Some(Button::Undo),
-                        K::Y => Some(Button::Redo),
-                        K::H => Some(Button::Hide),
-                        K::I => Some(Button::Isolate),
-                        K::A => Some(Button::ShowAll),
-                        K::D => Some(Button::Clear),
-                        K::R => Some(Button::Recentre),
-                        K::F => Some(Button::Faces),
-                        K::P => Some(Button::PushPull),
-                        K::L => Some(Button::Place),
-                        K::J => Some(Button::Size),
-                        K::U => Some(Button::Snap),
-                        K::S if k.shift => Some(Button::SaveFile),
-                        K::S => Some(Button::Section),
-                        K::M => Some(Button::Measure),
-                        K::E => Some(Button::Edges),
-                        K::X => Some(Button::Explode),
-                        K::N => Some(Button::Note),
-                        K::B => Some(Button::Room),
-                        K::O => Some(Button::Models),
-                        K::G => Some(Button::Guides),
-                        K::K => Some(Button::Keyboard),
-                        K::T => Some(Button::Repeat),
-                        K::W => Some(Button::SaveReq),
-                        K::Q => Some(Button::Saved),
-                        _ => key_btn,
-                    };
+                    // Ctrl with a key: the command bound to it (src/commands.rs).
+                    key_btn = commands::by_key(k.code, k.shift).or(key_btn);
                     continue;
                 }
                 match k.code {
@@ -3391,6 +3844,16 @@ fn run(app: &AndroidApp) {
                             continue;
                         }
                         typed.clear();
+                        // In push/pull, a number alone moves the face pointed at by exactly that many mm.
+                        if let (true, Some(b), Some(p), Ok(mm)) = (pushing, hovered, hit_point, text.trim_end_matches("mm").trim().parse::<f32>()) {
+                            if mm.abs() >= 0.5 {
+                                log::info!("push/pull {} by {mm} mm (typed)", scene.bodies[b].name);
+                                voice::push_pull(voice::pin_text(&scene.bodies[b].name, sub(p, off(b))), mm);
+                            } else {
+                                voice::say("SolidCraft moves a face by half a millimetre or more.");
+                            }
+                            continue;
+                        }
                         // Like speaking: the spot under the pointer goes with it ("make this red").
                         talk_point = match (hovered, hit_point) {
                             (Some(b), Some(p)) => Some((b, sub(p, off(b)))),
@@ -3432,6 +3895,25 @@ fn run(app: &AndroidApp) {
             if key_btn.is_some() {
                 log::info!("key for button {key_btn:?}");
             }
+            // Parts the server found for "select the posts": they become the selection.
+            if let Some(names) = voice::take_select() {
+                for (sel, b) in selected.iter_mut().zip(scene.bodies.iter()) {
+                    *sel = names.iter().any(|n| n == &b.name);
+                }
+                log::info!("selected by name: {} part(s)", selected.iter().filter(|&&s| s).count());
+            }
+            // The Mac is told what is hidden whenever that changes.
+            if hidden != hidden_sent && voice::MAC.lock().ok().is_some_and(|m| m.is_some()) {
+                hidden_sent = hidden.clone();
+                voice::sync_hidden(names_where(&scene, &hidden));
+            }
+            // A spoken or typed command the server recognised: the same button, one a frame.
+            if key_btn.is_none() {
+                if let Some(id) = voice::take_command() {
+                    key_btn = commands::by_id(&id);
+                    log::info!("command {id} for button {key_btn:?}");
+                }
+            }
             let ctrl_trig = trigger.state(&session, hand_paths[1]).map(|st| st.current_state > 0.6).unwrap_or(false);
             if ctrl_trig {
                 use_mouse = false;
@@ -3443,7 +3925,213 @@ fn run(app: &AndroidApp) {
                 let pages = (reply_lines().len() + REPLY_ROWS - 1) / REPLY_ROWS;
                 reply_page = if pages == 0 { 0 } else { (reply_page + 1) % pages };
             }
-            if (trig && !trigger_was) || key_btn.is_some() {
+            // The radial menu.
+            let radial_was_open = radial.is_some();
+            let stick_down = stick_click.state(&session, hand_paths[1]).map(|st| st.current_state).unwrap_or(false);
+            let mut radial_took_trigger = false;
+            if radial.is_none() && (key_btn == Some(Button::Radial) || (stick_down && !click_was[1])) {
+                if let Some((pm, _)) = ray {
+                    let by_stick = key_btn != Some(Button::Radial);
+                    let any_selected = selected.iter().any(|s| *s);
+                    let (what, items): (&'static str, Vec<Button>) = if face_mode && hovered_face.is_some() {
+                        ("face", vec![Button::PushPull, Button::Measure, Button::Section, Button::Note, Button::Faces, Button::Clear, Button::Undo, Button::Redo])
+                    } else if hovered.is_some() || any_selected {
+                        ("part", vec![Button::Hide, Button::Isolate, Button::Move, Button::Measure, Button::Handles, Button::Dims, Button::Undo, Button::Redo])
+                    } else {
+                        ("nothing", vec![Button::ShowAll, Button::Recentre, Button::Explode, Button::Size, Button::Models, Button::Clash, Button::Undo, Button::Redo])
+                    };
+                    // A menu for the part pointed at acts on it: it is selected if nothing is.
+                    if let (Some(b), false, "part") = (hovered, any_selected, what) {
+                        selected[b] = true;
+                    }
+                    let line: Vec<String> = items.iter().enumerate().map(|(i, b)| format!("{} {}", svr::radial::way(i, items.len()), radial_label(*b))).collect();
+                    log::info!("radial: open for {what}: {}", line.join(" | "));
+                    let names: Vec<&str> = items.iter().map(|b| radial_label(*b)).collect();
+                    voice::say(&format!("Menu, from up, clockwise: {}", names.join(", ")));
+                    // The ring stands a forearm's length along the ray, upright and facing the head, so it is
+                    // seen as a ring from wherever the hand is, and "up" on it is up in the room. (Square to the
+                    // ray, a hand held low and to the side showed it nearly edge on.)
+                    let hand0 = [pm[12], pm[13], pm[14]];
+                    let o = [0, 1, 2].map(|k| pm[12 + k] - pm[8 + k] * 0.3);
+                    let to_head = head_now.map_or([pm[8], pm[9], pm[10]], |h| sub(h, o));
+                    let flat = [to_head[0], 0.0, to_head[2]];
+                    let n = if dot(flat, flat) > 1e-6 { normalize(flat) } else { [0.0, 0.0, 1.0] };
+                    let (up, right) = ([0.0, 1.0, 0.0], normalize(cross([0.0, 1.0, 0.0], n)));
+                    let mut frame = pm;
+                    for k in 0..3 {
+                        (frame[k], frame[4 + k], frame[8 + k], frame[12 + k]) = (right[k], up[k], n[k], o[k]);
+                    }
+                    radial = Some((frame, items, None, by_stick, what, hand0));
+                }
+                key_btn = None;
+            } else if key_btn == Some(Button::Radial) {
+                log::info!("radial: closed, nothing run");
+                voice::say("");
+                radial = None;
+                key_btn = None;
+            } else if let Some((pm0, items, pick, by_stick, _, hand0)) = radial.as_mut() {
+                // The choice: the way the stick is pushed, else the way the hand has moved since it opened.
+                let pushed = stick.state(&session, hand_paths[1]).ok().map(|st| st.current_state).filter(|v| v.x.abs() > 0.3 || v.y.abs() > 0.3);
+                let now = match (pushed, ray) {
+                    (Some(v), _) => svr::radial::sector(v.x, v.y, items.len(), 0.5),
+                    (None, Some((pm, _))) => {
+                        let d = sub([pm[12], pm[13], pm[14]], *hand0);
+                        svr::radial::sector(dot(d, [pm0[0], pm0[1], pm0[2]]), dot(d, [pm0[4], pm0[5], pm0[6]]), items.len(), 0.04)
+                    }
+                    _ => *pick,
+                };
+                if now != *pick {
+                    *pick = now;
+                    voice::say(&now.map_or("Menu: let go here for nothing".to_string(), |i| format!("Menu: {} ({})", radial_label(items[i]), svr::radial::way(i, items.len()))));
+                }
+                let take = if *by_stick { !stick_down } else { trig && !trigger_was };
+                if take {
+                    radial_took_trigger = !*by_stick;
+                    match *pick {
+                        Some(i) => {
+                            radial_ran += 1;
+                            log::info!("radial: {:?} run ({})", items[i], svr::radial::way(i, items.len()));
+                            key_btn = Some(items[i]);
+                        }
+                        // The stick pressed and let go without a push: what that press has always done.
+                        None if *by_stick => key_btn = Some(Button::Hide),
+                        None => log::info!("radial: closed, nothing run"),
+                    }
+                    radial = None;
+                }
+            }
+            if radial_was_open && radial.is_none() {
+                stick_rest = true;
+            }
+            // Dimension handles: which one the pointer is on, the drag of one, and the press that starts it.
+            let handle_list = if handles_on { voice::HANDLES.lock().map(|h| h.clone()).unwrap_or_default() } else { Vec::new() };
+            let handle_len = 0.05 / unit; // the arrow's length, in model units (5 cm in the room)
+            handle_hover = None;
+            if let (Some((pm, _)), None, false, false) = (ray, &handle_drag, on_panel, on_kb) {
+                let (o, d) = ([pm[12], pm[13], pm[14]], normalize([-pm[8], -pm[9], -pm[10]]));
+                let mut best = f32::MAX; // the pointer must be within 3 cm of the arrow's head
+                // For test scripts: now and then, how far each arrow's head is from the ray, to the pointer's
+                // right and upward (metres), so a script can steer onto one by name.
+                let mut where_log: Vec<String> = Vec::new();
+                debug_handle_n = debug_handle_n.wrapping_add(1);
+                for (i, h) in handle_list.iter().enumerate() {
+                    let tip = transform(&model, [0, 1, 2].map(|k| h.at[k] + h.dir[k] * handle_len), 1.0);
+                    let v = sub(tip, o);
+                    if debug_ray && debug_handle_n % 20 == 0 {
+                        where_log.push(format!("{}@{:.4},{:.4}", h.label.replace(' ', "_"), dot(v, [pm[0], pm[1], pm[2]]), dot(v, [pm[4], pm[5], pm[6]])));
+                    }
+                    let t = dot(v, d);
+                    let off_ray = sub(v, d.map(|x| x * t));
+                    let dist = dot(off_ray, off_ray).sqrt();
+                    // Of two arrows that line up from here, the nearer one is taken.
+                    let score = dist + 0.02 * t;
+                    if t > 0.0 && dist < 0.03 && score < best {
+                        best = score;
+                        handle_hover = Some(i);
+                    }
+                }
+                if !where_log.is_empty() {
+                    log::info!("HANDLERAY {}", where_log.join(";"));
+                }
+            }
+            if let Some((i, ref mut drag, hand0, dir_w, ref mut value)) = handle_drag {
+                match (handle_list.get(i).filter(|h| h.id == handle_drag_id), ray) {
+                    (None, _) => {
+                        log::info!("handle drag dropped: the model changed under it");
+                        voice::say("The model changed, so that drag was dropped.");
+                        handle_drag = None;
+                    }
+                    (Some(h), Some((pm, _))) => {
+                        let along = (dot(sub([pm[12], pm[13], pm[14]], hand0), dir_w) / unit) as f64;
+                        let fine = held[1];
+                        let step = pp_step(unit) as f64;
+                        let moved = svr::precise::snap(drag.update(along, fine), if fine { svr::precise::fine_step(step, 0.1) } else { step });
+                        let mut now = h.value + h.gain * moved as f32;
+                        if h.id.starts_with("joint:") {
+                            // Whole degrees or millimetres; tenths with the grip.
+                            now = if fine { (now * 10.0).round() / 10.0 } else { now.round() };
+                        }
+                        let stopped = now < h.min || now > h.max;
+                        let now = now.clamp(h.min, h.max);
+                        if stopped && !handle_at_limit {
+                            buzzes += 1;
+                            let buzz = xr::HapticVibration::new().amplitude(0.8).duration(xr::Duration::from_nanos(70_000_000)).frequency(xr::FREQUENCY_UNSPECIFIED);
+                            let sent = haptic.apply_feedback(&session, hand_paths[1], &buzz);
+                            log::info!("haptic: buzz {buzzes}, {} at its limit of {} {} ({:?})", h.label, now, h.unit, sent.map(|_| "sent"));
+                        }
+                        handle_at_limit = stopped;
+                        if (now - *value).abs() > 1e-4 {
+                            *value = now;
+                            voice::say(&format!("{}: {} {}", h.label, fmt_dim(now), h.unit));
+                        }
+                        if !trig {
+                            if (now - h.value).abs() > 1e-4 {
+                                log::info!("handle {} ({}): {} -> {}", h.label, h.id, h.value, now);
+                                voice::set_dim(&h.id, now);
+                            }
+                            handle_drag = None;
+                        }
+                    }
+                    _ => {
+                        if !trig {
+                            handle_drag = None;
+                        }
+                    }
+                }
+            }
+            // Moving a part: the move so far, and the release.
+            if let Some((b, grab, hand0, ref mut drags, ref mut by)) = move_drag {
+                if let Some((pm, _)) = ray {
+                    let inv = invert(&model);
+                    let d_m = transform(&inv, sub([pm[12], pm[13], pm[14]], hand0), 0.0);
+                    let fine = held[1];
+                    let step = pp_step(unit) as f64;
+                    let step = if fine { svr::precise::fine_step(step, 0.1) } else { step };
+                    let mut now = [0, 1, 2].map(|k| svr::precise::snap(drags[k].update(d_m[k] as f64, fine), step) as f32);
+                    // Nearly along one of the model's axes: exactly along it.
+                    let big = now.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    if big > 0.0 {
+                        for v in now.iter_mut() {
+                            if v.abs() < 0.2 * big {
+                                *v = 0.0;
+                            }
+                        }
+                    }
+                    *by = now;
+                }
+                if !trig {
+                    let by = *by;
+                    let name = scene.bodies.get(b).map(|x| x.name.clone()).unwrap_or_default();
+                    match (hovered.filter(|&t| t != b), hit_point) {
+                        (Some(t), Some(p)) => {
+                            log::info!("move {name}: set on {} at {:?}", scene.bodies[t].name, sub(p, off(t)));
+                            voice::move_part(name, by, Some((grab, sub(p, off(t)), hit_normal)));
+                        }
+                        _ if by.iter().any(|v| v.abs() > 1e-4) => {
+                            log::info!("move {name}: by {by:?} mm");
+                            voice::move_part(name, by, None);
+                        }
+                        _ => {}
+                    }
+                    move_drag = None;
+                }
+            }
+            let move_click = trig && !trigger_was && key_btn.is_none() && radial.is_none() && !radial_took_trigger && moving && move_drag.is_none() && !on_panel && !on_kb && hovered.is_some() && hit_point.is_some();
+            if let (true, Some(b), Some(p), Some((pm, _))) = (move_click, hovered, hit_point, ray) {
+                move_drag = Some((b, sub(p, off(b)), [pm[12], pm[13], pm[14]], [svr::precise::Drag::start(0.0, 0.0); 3], [0.0; 3]));
+                log::info!("move {}: taken hold of", scene.bodies[b].name);
+            }
+            let handle_click = trig && !trigger_was && key_btn.is_none() && radial.is_none() && handle_drag.is_none() && handle_hover.is_some() && !move_click;
+            if let (true, Some(i), Some((pm, _))) = (handle_click, handle_hover, ray) {
+                if let Some(h) = handle_list.get(i) {
+                    let dir_w = normalize(transform(&model, h.dir, 0.0));
+                    handle_drag = Some((i, svr::precise::Drag::start(0.0, 0.0), [pm[12], pm[13], pm[14]], dir_w, h.value));
+                    handle_at_limit = false;
+                    handle_drag_id = h.id.clone();
+                    log::info!("handle {}: taken hold of at {}", h.label, h.value);
+                }
+            }
+            if ((trig && !trigger_was) && radial.is_none() && !radial_took_trigger && !handle_click && handle_drag.is_none() && !move_click && move_drag.is_none()) || key_btn.is_some() {
                 if let (true, None) = (on_kb, key_btn) {
                     // The on-screen keyboard: a key types into the request line; the bar is taken hold of to move it.
                     match kb_hover {
@@ -3499,6 +4187,53 @@ fn run(app: &AndroidApp) {
                                 log::info!("saved request: {}", r.text);
                                 voice::run_saved(r.text);
                                 overlay = Overlay::Off;
+                            }
+                        }
+                    } else if let (Some(i), Overlay::Features) = (model_pick, overlay) {
+                        // A feature: the target at the right switches it off or on; the rest of the row opens its
+                        // dimensions.
+                        let total = voice::FEATURES.lock().ok().and_then(|l| l.as_ref().map(|l| l.len())).unwrap_or(0);
+                        let (per, pages) = dims_paging(total);
+                        feat_page = feat_page.min(pages - 1);
+                        if pages > 1 && i == per {
+                            feat_page = (feat_page + 1) % pages;
+                            log::info!("features: page {} of {pages}", feat_page + 1);
+                        } else if let Some(f) = voice::FEATURES.lock().ok().and_then(|l| l.as_ref().and_then(|l| l.get(feat_page * per + i).filter(|_| i < per).cloned())) {
+                            if PANEL_W / 2.0 - overlay_x < DIM_ZONE * 2.0 {
+                                log::info!("feature {} ({}): switch {}", f.name, f.id, if f.off { "on" } else { "off" });
+                                voice::toggle_feature(&f.id);
+                            } else {
+                                log::info!("feature {} ({}): its dimensions", f.name, f.id);
+                                voice::set_dims_of(&f.name);
+                                overlay = Overlay::Dims;
+                                dims_page = 0;
+                                if let Ok(mut d) = voice::DIMS.lock() {
+                                    *d = None;
+                                }
+                                voice::fetch_dims();
+                            }
+                        }
+                    } else if let (Some(i), Overlay::Dims) = (model_pick, overlay) {
+                        // A dimension: the - and + at the right end change it by one step, on the Mac, with no AI.
+                        let total = voice::DIMS.lock().ok().and_then(|l| l.as_ref().map(|l| l.len())).unwrap_or(0);
+                        let (per, pages) = dims_paging(total);
+                        dims_page = dims_page.min(pages - 1);
+                        let d = if pages > 1 && i == per {
+                            // The last row of a long list: the next page.
+                            dims_page = (dims_page + 1) % pages;
+                            log::info!("dimensions: page {} of {pages}", dims_page + 1);
+                            None
+                        } else {
+                            voice::DIMS.lock().ok().and_then(|l| l.as_ref().and_then(|l| l.get(dims_page * per + i).filter(|_| i < per).cloned()))
+                        };
+                        if let Some(d) = d {
+                            let side = PANEL_W / 2.0 - overlay_x;
+                            let dir = if side < DIM_ZONE { 1.0 } else if side < DIM_ZONE * 2.0 { -1.0 } else { 0.0 };
+                            if dir != 0.0 {
+                                // A joint moves 5 (degrees or mm) a press, from wherever it is, zero included.
+                                let value = if d.id.starts_with("joint:") { ((d.value / 5.0 + dir * 1.001).round()) * 5.0 } else { dim_step_to(d.value, dir) };
+                                log::info!("dimension {} ({}): {} -> {}", d.label, d.id, d.value, value);
+                                voice::set_dim(&d.id, value);
                             }
                         }
                     } else if let Some(i) = model_pick {
@@ -3571,6 +4306,47 @@ fn run(app: &AndroidApp) {
                             Button::ConfirmStop => voice::cancel_confirm(),
                             Button::Repeat => voice::repeat_last(),
                             Button::SaveReq => voice::save_last(),
+                            Button::Radial => {} // opened and closed above
+                            Button::Clash => {
+                                if clash_names.is_empty() {
+                                    voice::check_clash();
+                                } else {
+                                    voice::drop_clash();
+                                }
+                            }
+                            Button::Move => {
+                                moving = !moving;
+                                if moving {
+                                    voice::say("Move: hold the trigger on a part and move your hand. Let go on another part to set it there.");
+                                }
+                            }
+                            Button::Handles => {
+                                handles_on = !handles_on;
+                                if handles_on {
+                                    voice::fetch_handles();
+                                }
+                            }
+                            Button::Features => {
+                                overlay = if overlay == Overlay::Features { Overlay::Off } else { Overlay::Features };
+                                if overlay == Overlay::Features {
+                                    feat_page = 0;
+                                    if let Ok(mut d) = voice::FEATURES.lock() {
+                                        *d = None;
+                                    }
+                                    voice::fetch_features();
+                                }
+                            }
+                            Button::Dims => {
+                                overlay = if overlay == Overlay::Dims { Overlay::Off } else { Overlay::Dims };
+                                if overlay == Overlay::Dims {
+                                    voice::set_dims_of("");
+                                    dims_page = 0;
+                                    if let Ok(mut d) = voice::DIMS.lock() {
+                                        *d = None;
+                                    }
+                                    voice::fetch_dims();
+                                }
+                            }
                             Button::Saved => {
                                 overlay = if overlay == Overlay::Requests { Overlay::Off } else { Overlay::Requests };
                                 if overlay == Overlay::Requests {
@@ -3617,8 +4393,10 @@ fn run(app: &AndroidApp) {
                                 }
                             }
                             Button::Recentre => {
+                                model_inner = crate::model_inner(&scene.bounds());
+                                inner_scale = 1.6 / longest_side(&scene.bounds());
                                 world = None;
-                                grab = None;
+                                grab.release();
                                 need_anchor = true;
                                 anchor = None;
                                 anchor_saved = None;
@@ -3631,8 +4409,7 @@ fn run(app: &AndroidApp) {
                                 let w0 = world.unwrap_or(cur);
                                 let sc0 = (w0[0] * w0[0] + w0[1] * w0[1] + w0[2] * w0[2]).sqrt().max(1e-6);
                                 let bb = scene.bounds();
-                                let longest_m = (0..3).map(|k| bb[k + 3] - bb[k]).fold(0.0f32, f32::max).max(1e-3) / 1000.0;
-                                let now = 1.6 * sc0 / longest_m;
+                                let now = inner_scale * 1000.0 * sc0;
                                 let next = SIZE_STEPS.iter().copied().find(|&x| x > now * 1.05).unwrap_or(SIZE_STEPS[1]);
                                 let k = next / now;
                                 let m0 = mul(&w0, &model_inner);
@@ -3640,7 +4417,7 @@ fn run(app: &AndroidApp) {
                                 let low = corners.iter().map(|c| c[1]).fold(f32::MAX, f32::min);
                                 let p = [corners.iter().map(|c| c[0]).sum::<f32>() / 8.0, low, corners.iter().map(|c| c[2]).sum::<f32>() / 8.0];
                                 world = Some(mul(&translate(p[0], p[1], p[2]), &mul(&scale(k), &mul(&translate(-p[0], -p[1], -p[2]), &w0))));
-                                voice::say(&format!("Size x{next} of the file's: {:.0} cm long.", next * longest_m * 100.0));
+                                voice::say(&format!("Size x{next} of the file's: {:.0} cm long.", next * longest_side(&bb) / 10.0));
                             }
                             Button::Place => {
                                 placing = !placing;
@@ -3762,7 +4539,12 @@ fn run(app: &AndroidApp) {
                                 }
                             }
                             Button::Explode => {
-                                explode_target = Some(if explode > 0.01 { 0.0 } else { 1.0 });
+                                if voice::explode_views() > 0 {
+                                    // An assembly with exploded views of its own: SolidCraft's, one after another.
+                                    voice::explode_next();
+                                } else {
+                                    explode_target = Some(if explode > 0.01 { 0.0 } else { 1.0 });
+                                }
                             }
                             Button::Edges => {
                                 edges = match edges {
@@ -3834,7 +4616,7 @@ fn run(app: &AndroidApp) {
                         let longest_mm = (0..3).map(|k| bb0[k + 3] - bb0[k]).fold(0.0f32, f32::max).max(1e-3);
                         let real_m = longest_mm / 1000.0;
                         let (target_m, one_to_one) = if real_m <= 0.45 { (real_m, true) } else { (0.3, false) };
-                        let (sc, yaw) = (target_m / 1.6, (-cur[2]).atan2(cur[0]));
+                        let (sc, yaw) = (target_m / (inner_scale * longest_mm), (-cur[2]).atan2(cur[0]));
                         let level = mul(&translate(cur[12], cur[13], cur[14]), &mul(&rot_y(yaw), &scale(sc)));
                         let model_l = mul(&level, &model_inner);
                         let bb = scene.bounds();
@@ -3954,8 +4736,14 @@ fn run(app: &AndroidApp) {
                     pp_acc += mouse.wheel;
                     *mm = pp_acc.round() * step;
                 } else if let Some((pm, _)) = ray {
-                    let moved_m = dot(sub([pm[12], pm[13], pm[14]], hand0), n_w);
-                    *mm = (moved_m / unit / step).round() * step;
+                    // The hand's move along the face's normal, in mm. With the same hand's grip held it counts
+                    // a tenth and lands on a finer step (svr::precise).
+                    let along = (dot(sub([pm[12], pm[13], pm[14]], hand0), n_w) / unit) as f64;
+                    let fine = held[1];
+                    let drag = pp_precise.get_or_insert_with(|| svr::precise::Drag::start(along, 0.0));
+                    let value = drag.update(along, fine);
+                    let s = if fine { svr::precise::fine_step(step as f64, 0.5) } else { step as f64 };
+                    *mm = svr::precise::snap(value, s) as f32;
                 }
                 if !trig && pp_wheel_until.map_or(true, |t| Instant::now() >= t) {
                     pp_wheel_until = None;
@@ -3965,6 +4753,7 @@ fn run(app: &AndroidApp) {
                         voice::push_pull(voice::pin_text(&scene.bodies[b].name, p), d);
                     }
                     pp_drag = None;
+                    pp_precise = None;
                 }
             }
             // Re-recording: in note mode, with one note selected and no new pin, the left trigger records new words for it.
@@ -4003,10 +4792,7 @@ fn run(app: &AndroidApp) {
                 let click = stick_click.state(&session, hand_paths[h]).map(|st| st.current_state).unwrap_or(false);
                 if click && !click_was[h] {
                     if h == 1 {
-                        for (h, s) in hidden.iter_mut().zip(selected.iter_mut()) {
-                            *h |= *s;
-                            *s = false;
-                        }
+                        // The right stick opens the radial menu (above); pressed and let go, it hides.
                     } else {
                         hidden.iter_mut().for_each(|x| *x = false);
                         log::info!("showing all bodies");
@@ -4041,6 +4827,40 @@ fn run(app: &AndroidApp) {
             let push_for = |m: &M4, tint: [f32; 4]| push_for_cut(m, tint, NO_PLANE);
             // Extra bars drawn with the ray box (world matrices): the outline of the cut, measure points and line.
             let mut bars: Vec<(M4, [f32; 4])> = Vec::new();
+            // The radial menu: a ring of blocks where the hand was when it opened, the marked one bigger and
+            // light blue, and a line from the middle to the hand.
+            if let Some((pm0, items, pick, _, _, hand0)) = &radial {
+                // Its frame was set when it opened: upright, facing the head, a forearm's length along the ray.
+                let (right, up) = ([pm0[0], pm0[1], pm0[2]], [pm0[4], pm0[5], pm0[6]]);
+                let o = [pm0[12], pm0[13], pm0[14]];
+                let at = |x: f32, y: f32| [0, 1, 2].map(|k| o[k] + right[k] * x + up[k] * y);
+                for i in 0..items.len() {
+                    let (x, y) = svr::radial::centre(i, items.len(), 0.08);
+                    let (size, tint) = if *pick == Some(i) { (0.03, [0.2, 0.75, 1.0, 1.0]) } else { (0.016, [1.0, 0.8, 0.15, 1.0]) };
+                    bars.push((bar(at(x, y - size / 2.0), at(x, y + size / 2.0), size), tint));
+                }
+                bars.push((bar(at(0.0, -0.003), at(0.0, 0.003), 0.006), [1.0, 0.8, 0.15, 1.0]));
+                // The hand's move since it opened, as a line from the middle (the ring is 8 cm out; 4 cm picks).
+                if let Some((pm, _)) = ray {
+                    let d = sub([pm[12], pm[13], pm[14]], *hand0);
+                    let (x, y) = (dot(d, right).clamp(-0.08, 0.08), dot(d, up).clamp(-0.08, 0.08));
+                    if x.abs() > 0.002 || y.abs() > 0.002 {
+                        bars.push((bar(o, at(x, y), 0.003), [1.0, 0.8, 0.15, 1.0]));
+                    }
+                }
+            }
+            // Dimension handles: a thin shaft out of the model and a block at its end. The one pointed at is
+            // light blue; the one being dragged is green and drawn where the value now puts it.
+            for (i, h) in handle_list.iter().enumerate() {
+                let dragged = handle_drag.as_ref().filter(|d| d.0 == i).map(|d| (d.4 - h.value) / h.gain.max(1e-6));
+                let tint = if dragged.is_some() { [0.3, 1.0, 0.45, 1.0] } else if handle_hover == Some(i) { [0.35, 0.8, 1.0, 1.0] } else { [1.0, 0.8, 0.15, 1.0] };
+                let shift = dragged.unwrap_or(0.0);
+                let base = [0, 1, 2].map(|k| h.at[k] + h.dir[k] * shift.min(0.0));
+                let tip = [0, 1, 2].map(|k| h.at[k] + h.dir[k] * (shift + handle_len));
+                let head = 0.009 / unit;
+                bars.push((mul(&model, &bar(base, tip, 0.004 / unit)), tint));
+                bars.push((mul(&model, &bar([0, 1, 2].map(|k| tip[k] - h.dir[k] * head), [0, 1, 2].map(|k| tip[k] + h.dir[k] * head), 0.018 / unit)), tint));
+            }
             if section != Section::Off {
                 // A square around the model's middle, on the plane.
                 let bb = scene.bounds();
@@ -4147,20 +4967,46 @@ fn run(app: &AndroidApp) {
             }
             // Draw runs: consecutive bodies with the same state (and, when exploded, the same move) share
             // one draw call; hidden ones are skipped.
+            let previewing = voice::preview();
+            // A joint being dragged by its handle: the bodies it carries are drawn where the value now puts
+            // them (turned about the joint's axis, or slid along it), until the Mac's new model arrives.
+            let overlaps_shown = !clash_names.is_empty() && scene.bodies.iter().any(|b| b.name.starts_with("Overlap "));
+            const LIVE: [f32; 3] = [1.0e30, 0.0, 0.0];
+            let live: Option<(Vec<bool>, M4)> = handle_drag.as_ref().and_then(|d| {
+                let h = handle_list.get(d.0)?;
+                let (turns, o, z, names) = h.joint.as_ref()?;
+                let by = d.4 - h.value;
+                let m = if *turns {
+                    mul(&mul(&translate(o[0], o[1], o[2]), &rot_axis(normalize(*z), by.to_radians())), &translate(-o[0], -o[1], -o[2]))
+                } else {
+                    translate(z[0] * by, z[1] * by, z[2] * by)
+                };
+                Some((scene.bodies.iter().map(|b| names.iter().any(|n| *n == b.name)).collect(), m))
+            });
+            let off_draw = |i: usize| if live.as_ref().is_some_and(|l| l.0[i]) { LIVE } else { off(i) };
             let mut runs: Vec<(u32, u32, Option<[f32; 4]>, [f32; 3])> = Vec::new();
             for (i, b) in scene.bodies.iter().enumerate() {
-                let tint = if hidden[i] {
+                // An overlap stays on show whatever is hidden: Isolate on the parts in it must not take it away.
+                let tint = if b.name.starts_with("Overlap ") {
+                    Some(OVERLAP_TINT)
+                } else if hidden[i] {
                     None
+                } else if clash_names.iter().any(|n| *n == b.name) {
+                    // With the overlaps there as bodies, the parts are drawn as red edges only, so the
+                    // overlap inside them shows; without, the parts themselves turn red.
+                    if overlaps_shown { None } else { Some(CLASH_TINT) }
                 } else if selected[i] {
                     Some(SELECT_TINT)
                 } else if Some(i) == hovered && !edge_mode && !face_mode && !pushing {
                     Some(HOVER_TINT)
+                } else if previewing {
+                    Some(PREVIEW_TINT)
                 } else {
                     Some([0.0; 4])
                 };
                 match runs.last_mut() {
-                    Some(last) if last.2 == tint && last.3 == off(i) && last.0 + last.1 == b.first => last.1 += b.count,
-                    _ => runs.push((b.first, b.count, tint, off(i))),
+                    Some(last) if last.2 == tint && last.3 == off_draw(i) && last.0 + last.1 == b.first => last.1 += b.count,
+                    _ => runs.push((b.first, b.count, tint, off_draw(i))),
                 }
             }
 
@@ -4191,7 +5037,10 @@ fn run(app: &AndroidApp) {
             vk_device.cmd_bind_vertex_buffers(cmd, 0, &[vbuf], &[0]);
             vk_device.cmd_bind_index_buffer(cmd, ibuf, 0, vk::IndexType::UINT32);
             // A body moved by the exploded view: its matrix, and the cut moved back so it stays put in the model.
-            let moved = |o: [f32; 3]| (mul(&model, &translate(o[0], o[1], o[2])), [cut[0], cut[1], cut[2], cut[3] + dot([cut[0], cut[1], cut[2]], o)]);
+            let moved = |o: [f32; 3]| match &live {
+                Some((_, m)) if o == LIVE => (mul(&model, m), NO_PLANE),
+                _ => (mul(&model, &translate(o[0], o[1], o[2])), [cut[0], cut[1], cut[2], cut[3] + dot([cut[0], cut[1], cut[2]], o)]),
+            };
             let mut last_state = None;
             for &(first, count, tint, o) in &runs {
                 let Some(tint) = tint else { continue };
@@ -4211,7 +5060,14 @@ fn run(app: &AndroidApp) {
                 if hidden[i] {
                     continue;
                 }
-                let (range, tint) = if selected[i] {
+                let (range, tint) = if overlaps_shown && clash_names.iter().any(|n| *n == scene.bodies[i].name) {
+                    // A round part has no edges along its sides (a pin is two rings, seen from the side two
+                    // dashes): its triangle edges go under the outline, dimmer, so its shape is still there.
+                    if scene.feat[i].1 * 2 < scene.all[i].1 {
+                        draws.push((scene.all[i].0, scene.all[i].1, [0.5, 0.1, 0.08, 1.0], off_draw(i)));
+                    }
+                    (scene.feat[i], [1.0, 0.15, 0.1, 1.0])
+                } else if selected[i] {
                     (scene.feat[i], SELECT_EDGE_TINT)
                 } else {
                     match edges {
@@ -4224,8 +5080,8 @@ fn run(app: &AndroidApp) {
                     continue;
                 }
                 match draws.last_mut() {
-                    Some(last) if last.2 == tint && last.3 == off(i) && last.0 + last.1 == range.0 => last.1 += range.1,
-                    _ => draws.push((range.0, range.1, tint, off(i))),
+                    Some(last) if last.2 == tint && last.3 == off_draw(i) && last.0 + last.1 == range.0 => last.1 += range.1,
+                    _ => draws.push((range.0, range.1, tint, off_draw(i))),
                 }
             }
             if !draws.is_empty() {
@@ -4384,12 +5240,43 @@ fn run(app: &AndroidApp) {
                 let size_idx = {
                     let w = world.unwrap_or(cur);
                     let sc = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
-                    let bb = scene.bounds();
-                    let longest_m = (0..3).map(|k| bb[k + 3] - bb[k]).fold(0.0f32, f32::max).max(1e-3) / 1000.0;
-                    let now = 1.6 * sc / longest_m;
+                    let now = inner_scale * 1000.0 * sc;
                     SIZE_STEPS.iter().position(|&x| (now / x - 1.0).abs() < 0.05)
                 };
-                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, reply_page, overlay, overlay_hover };
+                // For tests without a headset (SCVIEW_DEBUG_RAY=1): what the viewer holds, ten times a second.
+                if debug_ray {
+                    debug_state_n = debug_state_n.wrapping_add(1);
+                    if debug_state_n % 6 == 0 {
+                        let names = |v: &Vec<bool>| scene.bodies.iter().zip(v).filter(|(_, &on)| on).map(|(b, _)| b.name.as_str()).collect::<Vec<_>>().join(",");
+                        log::info!(
+                            "VIEWSTATE hover={} sel=[{}] faces={} edges={} hidden=[{}] section={:?} cut={:?} measuring={} measure={:?} explode={:.2} mode={} pushing={} pull={:?} handles={} handle={} dragging={} moving={} move={} clash=[{}] live={} buzzes={} radial={} ran={}",
+                            hovered.map_or("-", |i| scene.bodies[i].name.as_str()),
+                            names(&selected),
+                            selected_faces.len(),
+                            selected_edges.len(),
+                            names(&hidden),
+                            section,
+                            cut,
+                            measuring,
+                            measure,
+                            explode,
+                            if edge_mode { "edges" } else if face_mode { "faces" } else { "parts" },
+                            pushing,
+                            pp_drag.as_ref().map(|d| d.6),
+                            handle_list.len(),
+                            handle_hover.and_then(|i| handle_list.get(i)).map_or("-".to_string(), |h| h.label.replace(' ', "_")),
+                            handle_drag.as_ref().map_or("-".to_string(), |d| format!("{}", d.4)),
+                            moving,
+                            move_drag.as_ref().map_or("-".to_string(), |d| format!("{}:{},{},{}", scene.bodies[d.0].name, d.4[0], d.4[1], d.4[2])),
+                            clash_names.join(","),
+                            handle_drag.as_ref().and_then(|d| handle_list.get(d.0)).and_then(|h| h.joint.as_ref()).map_or(0, |j| j.3.len()),
+                            buzzes,
+                            radial.as_ref().map_or("-".to_string(), |r| format!("{}:{}", r.4, r.2.map_or("-".to_string(), |i| format!("{:?}", r.1[i])))),
+                            radial_ran
+                        );
+                    }
+                }
+                let st = PanelState { hover: hover_btn, has_selection: n_sel > 0 || !selected_faces.is_empty() || !selected_edges.is_empty(), can_undo: !undo.is_empty(), room_off: !passthrough_on, section, measuring, edges, exploded: explode > 0.01, noting, open_notes: notes.iter().filter(|n| !n.done).count(), notes_selected: notes.iter().filter(|n| note_sel.contains(&n.id)).count(), can_redo: !redo.is_empty(), faces: face_mode, pick_edges: edge_mode, pushing, placing, size_idx, guides, tab, kb_open, undo_what: undo.last().map_or("", step_what), redo_what: redo.last().map_or("", step_what), reply_page, dims_page, feat_page, handles: handles_on, moving, clash: !clash_names.is_empty(), overlay, overlay_hover };
                 let ui = build_panel(&title, &subtitle, &st, &lay, hovered_note.map(|i| notes[i].text.as_str()));
                 let nv = (ui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);
                 let ni = ui.indices.len().min(UI_MAX_INDICES) / 6 * 6;
@@ -4412,6 +5299,34 @@ fn run(app: &AndroidApp) {
                 std::ptr::copy_nonoverlapping(kui.verts.as_ptr(), vp, nv * VERTEX_SIZE);
                 std::ptr::copy_nonoverlapping(kui.indices.as_ptr() as *const u8, ip, ni * 4);
                 push(cmd, &push_for(km, [0.0; 4]));
+                vk_device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
+                vk_device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
+                vk_device.cmd_draw_indexed(cmd, ni as u32, 1, 0, 0, 0);
+            }
+            // The radial menu's names, each beside its block, on the ring's own upright plane. They use the
+            // keyboard's buffers, so they are left out while the keyboard is open (the panel still lists them).
+            if let (None, Some((pm0, items, pick, _, _, _))) = (&kb_m, &radial) {
+                let mut rui = Ui { verts: Vec::new(), indices: Vec::new() };
+                let fp = FONT_PX * 1.7;
+                let h = font::FONT_H as f32 * fp;
+                for (i, b) in items.iter().enumerate() {
+                    let (x, y) = svr::radial::centre(i, items.len(), 0.108);
+                    let name = radial_label(*b);
+                    let w = Ui::text_width_px(name, fp);
+                    // Outward of the block: to its right on the right half, to its left on the left, centred above and below.
+                    let x0 = if x > 0.02 { x } else if x < -0.02 { x - w } else { x - w / 2.0 };
+                    let top = if y > 0.02 { y + h } else if y < -0.02 { y } else { y + h / 2.0 };
+                    let picked = *pick == Some(i);
+                    rui.quad(x0 - 0.004, top - h - 0.003, x0 + w + 0.004, top + 0.003, 0.0, if picked { [30, 110, 180] } else { [18, 24, 34] });
+                    rui.text_px(name, x0, top, 0.001, if picked { [255, 255, 255] } else { [215, 225, 240] }, fp);
+                }
+                let nv = (rui.verts.len() / VERTEX_SIZE).min(UI_MAX_VERTS);
+                let ni = rui.indices.len().min(UI_MAX_INDICES) / 6 * 6;
+                let ni = rui.indices[..ni].iter().take_while(|&&i| (i as usize) < nv).count() / 6 * 6;
+                let (vb, _, vp, ib, _, ip) = ui_bufs[PIPELINE_DEPTH as usize + frame];
+                std::ptr::copy_nonoverlapping(rui.verts.as_ptr(), vp, nv * VERTEX_SIZE);
+                std::ptr::copy_nonoverlapping(rui.indices.as_ptr() as *const u8, ip, ni * 4);
+                push(cmd, &push_for(pm0, [0.0; 4]));
                 vk_device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
                 vk_device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
                 vk_device.cmd_draw_indexed(cmd, ni as u32, 1, 0, 0, 0);
@@ -4560,5 +5475,42 @@ fn run(app: &AndroidApp) {
         vk_device.destroy_render_pass(render_pass, None);
         vk_device.destroy_device(None);
         vk_instance.destroy_instance(None);
+    }
+}
+
+#[cfg(test)]
+mod dim_tests {
+    use super::{dim_step_to, fmt_dim};
+
+    #[test]
+    fn a_dimension_steps_by_a_round_tenth_and_lands_on_multiples() {
+        assert_eq!(dim_step_to(60.0, 1.0), 65.0);
+        assert_eq!(dim_step_to(60.0, -1.0), 55.0);
+        assert_eq!(dim_step_to(10.0, 1.0), 11.0);
+        assert_eq!(dim_step_to(6.0, -1.0), 5.5);
+        // A value between steps goes to the next multiple, not past it.
+        assert_eq!(dim_step_to(62.0, 1.0), 65.0);
+        assert_eq!(dim_step_to(62.0, -1.0), 60.0);
+        assert_eq!(dim_step_to(0.3, 1.0), 0.32);
+    }
+
+    #[test]
+    fn a_long_list_is_paged_and_a_short_one_is_not() {
+        use super::{dims_paging, MODELS_SHOWN};
+        assert_eq!(dims_paging(0), (1, 1));
+        assert_eq!(dims_paging(6), (6, 1));
+        assert_eq!(dims_paging(MODELS_SHOWN), (MODELS_SHOWN, 1));
+        // One more than fits: the last row becomes "next page", so 13 to a page.
+        assert_eq!(dims_paging(MODELS_SHOWN + 1), (MODELS_SHOWN - 1, 2));
+        assert_eq!(dims_paging(23), (13, 2));
+        assert_eq!(dims_paging(26), (13, 2));
+        assert_eq!(dims_paging(27), (13, 3));
+    }
+
+    #[test]
+    fn a_value_is_shown_without_trailing_zeros() {
+        assert_eq!(fmt_dim(60.0), "60");
+        assert_eq!(fmt_dim(5.5), "5.5");
+        assert_eq!(fmt_dim(0.125), "0.125");
     }
 }

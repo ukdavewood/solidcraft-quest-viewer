@@ -7,6 +7,7 @@
 //! `adb shell pm grant org.scview.viewer android.permission.RECORD_AUDIO`.
 
 use std::io::{Read, Write};
+#[cfg(target_os = "android")]
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -97,6 +98,10 @@ pub fn parse_comments(text: &str) -> Vec<Comment> {
 
 /// Push/pull: moves a face ("body\tx\ty\tz", a point on it) by `mm` (positive = outward) on the Mac.
 pub fn push_pull(face: String, mm: f32) {
+    if !mm.is_finite() {
+        set_status("", None, Some("That pull gave no usable distance; try again."));
+        return;
+    }
     if BUSY.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -286,6 +291,28 @@ fn model_history(path: &'static str, msg: &str) {
             Err(e) => set_status("", None, Some(&e)),
         }
         BUSY.store(false, Ordering::SeqCst);
+        fetch_history();
+    });
+}
+
+/// What the Mac's Undo and Redo would do next, in words ("thickness = 12"); "" when there is nothing.
+static HISTORY: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+pub fn history() -> (String, String) {
+    HISTORY.lock().map(|h| h.clone()).unwrap_or_default()
+}
+
+/// Fetches what Undo and Redo would do next (GET /history.txt) in the background.
+pub fn fetch_history() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else { return };
+        if let Ok(b) = crate::http_get(mac, "/history.txt", 10) {
+            let text = String::from_utf8_lossy(&b).to_string();
+            let first = |kind: &str| text.lines().find_map(|l| l.strip_prefix(kind).and_then(|r| r.strip_prefix('\t'))).unwrap_or("").to_string();
+            if let Ok(mut h) = HISTORY.lock() {
+                *h = (first("u"), first("r"));
+            }
+        }
     });
 }
 
@@ -311,11 +338,14 @@ fn set_status(state: &str, heard: Option<&str>, reply: Option<&str>) {
     }
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_camel_case_types)]
 type AAudioStreamBuilder = c_void;
+#[cfg(target_os = "android")]
 #[allow(non_camel_case_types)]
 type AAudioStream = c_void;
 
+#[cfg(target_os = "android")]
 #[link(name = "aaudio")]
 extern "C" {
     fn AAudio_createStreamBuilder(builder: *mut *mut AAudioStreamBuilder) -> i32;
@@ -333,7 +363,9 @@ extern "C" {
     fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32;
 }
 
+#[cfg(target_os = "android")]
 const AAUDIO_DIRECTION_INPUT: i32 = 1;
+#[cfg(target_os = "android")]
 const AAUDIO_FORMAT_PCM_I16: i32 = 1;
 const RATE: u32 = 16_000;
 
@@ -407,7 +439,54 @@ pub fn update(held: bool) {
     }
 }
 
+/// Desktop: records the default microphone with PipeWire's `pw-record` until the button is released.
+#[cfg(not(target_os = "android"))]
+fn record() -> Result<Vec<i16>, String> {
+    let mut child = std::process::Command::new("pw-record")
+        .args(["--rate", &RATE.to_string(), "--channels", "1", "--format", "s16", "--raw", "-"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("microphone: pw-record did not start ({e})"))?;
+    let Some(mut out) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err("microphone: no pw-record output".into());
+    };
+    log::info!("voice: recording at {RATE} Hz with pw-record");
+    if let Ok(mut p) = PCM.lock() {
+        p.1 = RATE;
+    }
+    let mut pcm: Vec<i16> = Vec::new();
+    let mut buf = [0u8; 3200];
+    let mut odd: Option<u8> = None;
+    let max = RATE as usize * 30;
+    while RECORDING.load(Ordering::SeqCst) && pcm.len() < max {
+        let n = match out.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let start = pcm.len();
+        let mut bytes: Vec<u8> = odd.take().into_iter().collect();
+        bytes.extend_from_slice(&buf[..n]);
+        if bytes.len() % 2 == 1 {
+            odd = bytes.pop();
+        }
+        pcm.extend(bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+        if let Ok(mut p) = PCM.lock() {
+            p.0.extend_from_slice(&pcm[start..]);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    log::info!("voice: {:.1} s recorded", pcm.len() as f32 / RATE as f32);
+    if pcm.len() < RATE as usize / 4 {
+        return Err("Too short: hold the left trigger while you speak.".into());
+    }
+    Ok(pcm)
+}
+
 /// Records until the button is released; 16 kHz mono samples.
+#[cfg(target_os = "android")]
 fn record() -> Result<Vec<i16>, String> {
     // SAFETY: plain AAudio C calls; the builder and stream pointers come from AAudio and are released here.
     unsafe {
@@ -637,6 +716,248 @@ pub fn delete_saved(id: &str) {
     });
 }
 
+/// A parameter or feature dimension the Mac can set directly (GET /dimensions.txt).
+#[derive(Clone)]
+pub struct Dim {
+    pub id: String,
+    pub label: String,
+    pub value: f32,
+    pub unit: String,
+}
+
+/// The dimensions, once fetched (None: not yet).
+pub static DIMS: Mutex<Option<Vec<Dim>>> = Mutex::new(None);
+
+/// Only this feature's dimensions are listed ("" for all): set when a feature is picked in the feature tree.
+static DIMS_OF: Mutex<String> = Mutex::new(String::new());
+
+pub fn dims_of() -> String {
+    DIMS_OF.lock().map(|f| f.clone()).unwrap_or_default()
+}
+
+pub fn set_dims_of(feature: &str) {
+    if let Ok(mut f) = DIMS_OF.lock() {
+        *f = feature.to_string();
+    }
+}
+
+/// Moves a part on the Mac (POST /move, no AI). `onto`: the point it was taken hold of and the point on
+/// another part it was let go over, when it should be set on that face; else it moves by `by` (model units).
+pub fn move_part(body: String, by: [f32; 3], onto: Option<([f32; 3], [f32; 3], [f32; 3])>) {
+    let finite = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
+    if !(finite(&by) && onto.as_ref().is_none_or(|(a, b, n)| finite(a) && finite(b) && finite(n))) {
+        set_status("", None, Some("That move gave no usable position; try again."));
+        return;
+    }
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    set_status("Moving the part...", Some(""), Some(""));
+    std::thread::spawn(move || {
+        let p = |v: [f32; 3]| format!("{}\t{}\t{}", v[0], v[1], v[2]);
+        let extra = match onto {
+            Some((from, to, n)) => {
+                format!("X-Body: {}\r\nX-From: {}\r\nX-To: {}\r\nX-Normal: {}\r\n", percent(&body), percent(&p(from)), percent(&p(to)), percent(&p(n)))
+            }
+            None => format!("X-Body: {}\r\nX-Translate: {}\r\n", percent(&body), percent(&p(by))),
+        };
+        match post_typed("/move", b"", "text/plain", 120, &extra) {
+            Ok(json) => {
+                if json.contains("\"changed\": true") {
+                    CHANGES.fetch_add(1, Ordering::SeqCst);
+                }
+                set_status("", None, Some(&json_string(&json, "reply").unwrap_or_default()));
+            }
+            Err(e) => set_status("", None, Some(&e)),
+        }
+        BUSY.store(false, Ordering::SeqCst);
+    });
+}
+
+/// The bodies the last interference check found overlapping (empty: none, or not checked).
+pub static CLASH: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Forget the last check (the model changed, or the wearer switched the marks off).
+pub fn clear_clash() {
+    if let Ok(mut c) = CLASH.lock() {
+        c.clear();
+    }
+}
+
+/// The wearer switched the marks off: forget them, and have the Mac show the design without the overlaps'
+/// own red bodies again (POST /interference with X-Clear).
+pub fn drop_clash() {
+    clear_clash();
+    std::thread::spawn(|| {
+        let _ = post_typed("/interference", b"", "text/plain", 60, "X-Clear: 1\r\n");
+    });
+}
+
+/// Asks the Mac which parts overlap (POST /interference). The bodies found are marked and selected, so
+/// Isolate shows only those; the reply names the pairs and their overlap.
+pub fn check_clash() {
+    set_status("Checking for overlaps...", Some(""), Some(""));
+    std::thread::spawn(|| match post_typed("/interference", b"", "text/plain", 120, "") {
+        Ok(json) => {
+            let names: Vec<String> = json_string(&json, "select").map(|s| s.split('\u{1f}').map(str::to_string).collect()).unwrap_or_default();
+            log::info!("clash: {} bodies overlap: {}", names.len(), json_string(&json, "reply").unwrap_or_default());
+            if let Ok(mut c) = CLASH.lock() {
+                *c = names.clone();
+            }
+            if !names.is_empty() {
+                if let Ok(mut q) = SELECT_IN.lock() {
+                    *q = Some(names);
+                }
+            }
+            set_status("", None, Some(&json_string(&json, "reply").unwrap_or_default()));
+        }
+        Err(e) => set_status("", None, Some(&e)),
+    });
+}
+
+/// A dimension's handle on the model (GET /handles.txt): where it is, the way it moves, and what a move of
+/// one model unit adds to the value (2 for a diameter taken hold of at its rim).
+#[derive(Clone)]
+pub struct Handle {
+    pub id: String,
+    pub label: String,
+    pub value: f32,
+    pub unit: String,
+    pub at: [f32; 3],
+    pub dir: [f32; 3],
+    pub gain: f32,
+    /// The least and most the value may be (a joint's limits; a size stays above 0.1).
+    pub min: f32,
+    pub max: f32,
+    /// A joint's handle: whether it turns (else it slides), its origin and axis in the model, and the
+    /// bodies it carries, so they can be shown moving while it is dragged.
+    pub joint: Option<(bool, [f32; 3], [f32; 3], Vec<String>)>,
+}
+
+/// The handles of the model on show (empty until fetched, or when the design has none).
+pub static HANDLES: Mutex<Vec<Handle>> = Mutex::new(Vec::new());
+
+/// Fetches the dimension handles (GET /handles.txt) in the background.
+pub fn fetch_handles() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else { return };
+        if let Ok(b) = crate::http_get(mac, "/handles.txt", 20) {
+            let list: Vec<Handle> = String::from_utf8_lossy(&b)
+                .lines()
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split('\t').collect();
+                    if f.len() < 11 {
+                        return None;
+                    }
+                    let n = |i: usize| f[i].parse::<f32>().ok();
+                    Some(Handle { id: f[0].into(), label: f[1].into(), value: n(2)?, unit: f[3].into(), at: [n(4)?, n(5)?, n(6)?], dir: [n(7)?, n(8)?, n(9)?], gain: n(10)?, min: f.get(12).and_then(|v| v.parse().ok()).unwrap_or(if f.len() > 12 { f32::NEG_INFINITY } else { 0.1 }), max: f.get(13).and_then(|v| v.parse().ok()).unwrap_or(f32::INFINITY), joint: if f.len() >= 22 { Some((f[14] == "revolute", [n(15)?, n(16)?, n(17)?], [n(18)?, n(19)?, n(20)?], f[21].split('\u{1f}').map(str::to_string).collect())) } else { None } })
+                })
+                .collect();
+            log::info!("handles: {} on the model", list.len());
+            if let Ok(mut h) = HANDLES.lock() {
+                *h = list;
+            }
+        }
+    });
+}
+
+/// A feature of the design's timeline (GET /features.txt).
+#[derive(Clone)]
+pub struct Feature {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub off: bool,
+    pub error: String,
+}
+
+/// The feature tree, once fetched (None: not yet).
+pub static FEATURES: Mutex<Option<Vec<Feature>>> = Mutex::new(None);
+
+/// Fetches the feature tree (GET /features.txt) in the background.
+pub fn fetch_features() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else {
+            say("The Mac isn't running serve.py (no beacon seen).");
+            return;
+        };
+        match crate::http_get(mac, "/features.txt", 10) {
+            Ok(b) => {
+                let list: Vec<Feature> = String::from_utf8_lossy(&b)
+                    .lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split('\t').collect();
+                        (f.len() >= 4).then(|| Feature { id: f[0].into(), name: f[1].into(), kind: f[2].into(), off: f[3] == "1", error: f.get(4).unwrap_or(&"").to_string() })
+                    })
+                    .collect();
+                if let Ok(mut d) = FEATURES.lock() {
+                    *d = Some(list);
+                }
+            }
+            Err(e) => say(&format!("Feature tree: {e}")),
+        }
+    });
+}
+
+/// Switches a feature off (suppressed) or on again (POST /feature, no AI): an undo step like any change.
+pub fn toggle_feature(id: &str) {
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        let r = post_typed("/feature", b"", "text/plain", 60, &format!("X-Id: {}\r\n", percent(&id)));
+        if r.as_ref().is_ok_and(|json| json.contains("\"changed\": true")) {
+            CHANGES.fetch_add(1, Ordering::SeqCst);
+        }
+        say(&r.map(|json| json_string(&json, "reply").unwrap_or_default()).unwrap_or_else(|e| e));
+        fetch_features();
+    });
+}
+
+/// Fetches the dimensions (GET /dimensions.txt) in the background.
+pub fn fetch_dims() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else {
+            say("The Mac isn't running serve.py (no beacon seen).");
+            return;
+        };
+        match crate::http_get(mac, "/dimensions.txt", 10) {
+            Ok(b) => {
+                let only = dims_of();
+                let list: Vec<Dim> = String::from_utf8_lossy(&b)
+                    .lines()
+                    .filter(|l| only.is_empty() || l.split('\t').nth(1).is_some_and(|label| label.strip_prefix(only.as_str()).is_some_and(|rest| rest.starts_with(' '))))
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split('\t').collect();
+                        let value = f.get(2)?.parse().ok()?;
+                        Some(Dim { id: f[0].into(), label: f[1].into(), value, unit: f.get(3).unwrap_or(&"").to_string() })
+                    })
+                    .collect();
+                if let Ok(mut d) = DIMS.lock() {
+                    *d = Some(list);
+                }
+            }
+            Err(e) => say(&format!("Dimensions: {e}")),
+        }
+    });
+}
+
+/// Sets one dimension on the Mac (POST /dimension, no AI); the beacon's new version brings the changed model.
+pub fn set_dim(id: &str, value: f32) {
+    if !value.is_finite() {
+        say("That drag gave no usable value; try again.");
+        return;
+    }
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        let r = post_typed("/dimension", b"", "text/plain", 30, &format!("X-Name: {}\r\nX-Value: {}\r\n", percent(&id), value));
+        // A change the panel's Undo can take back, like any other change to the model.
+        if r.as_ref().is_ok_and(|json| json.contains("\"changed\": true")) {
+            CHANGES.fetch_add(1, Ordering::SeqCst);
+        }
+        say(&r.map(|json| json_string(&json, "reply").unwrap_or_default()).unwrap_or_else(|e| e));
+        fetch_dims();
+    });
+}
+
 /// Asks the AI again with the last request's words (the Mac repeats what it did before, without the AI, when it can).
 pub fn repeat_last() {
     let text = LAST_REQUEST.lock().map(|t| t.clone()).unwrap_or_default();
@@ -803,6 +1124,18 @@ fn show_answer(json: &str) {
     if json.contains("\"changed\": true") || json.contains("\"changed\":true") {
         CHANGES.fetch_add(1, Ordering::SeqCst);
     }
+    // The request named parts to select ("select the posts"): the render loop selects them.
+    if let Some(names) = json_string(json, "select") {
+        if let Ok(mut q) = SELECT_IN.lock() {
+            *q = Some(names.split('\u{1f}').map(str::to_string).collect());
+        }
+    }
+    // The request was a command's phrase ("hide these"): the render loop runs it as that button.
+    if let Some(id) = json_string(json, "command") {
+        if let Ok(mut q) = COMMANDS_IN.lock() {
+            q.push(id);
+        }
+    }
     match json_string(json, "confirm_k") {
         Some(k) => {
             CONFIRM.store(true, Ordering::SeqCst);
@@ -811,26 +1144,120 @@ fn show_answer(json: &str) {
             let cost = if cents < 0.1 { "<0.1c".to_string() } else if cents < 10.0 { format!("~{cents:.1}c") } else { format!("~{:.0}c", cents) };
             set_status(&format!("Big: ~{k}k tokens, {cost}. Go on?"), Some(&heard), None);
         }
+        None if json.contains("\"preview\": true") => {
+            // Shown, not made: the panel offers Apply and Drop.
+            PREVIEW.store(true, Ordering::SeqCst);
+            set_status("Preview. Apply it?", Some(&heard), Some(&reply));
+        }
         None => set_status("", Some(&heard), Some(&reply)),
     }
+}
+
+/// Parts the server found for a "select ..." request, for the render loop to select (replacing the selection).
+static SELECT_IN: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+pub fn take_select() -> Option<Vec<String>> {
+    SELECT_IN.lock().ok()?.take()
+}
+
+/// How many exploded views of its own the design has (SolidCraft's, for assemblies); 0 until known.
+static EXPLODES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn explode_views() -> u32 {
+    EXPLODES.load(Ordering::SeqCst)
+}
+
+/// Asks the Mac how many exploded views the design has (GET /explodes.txt), in the background.
+pub fn fetch_explodes() {
+    std::thread::spawn(|| {
+        let Some(mac) = MAC.lock().ok().and_then(|m| *m) else { return };
+        if let Ok(b) = crate::http_get(mac, "/explodes.txt", 10) {
+            EXPLODES.store(String::from_utf8_lossy(&b).lines().filter(|l| !l.trim().is_empty()).count() as u32, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Shows the design's next exploded view, then the assembled design again (POST /explode).
+pub fn explode_next() {
+    std::thread::spawn(|| {
+        let r = post_typed("/explode", b"", "text/plain", 60, "");
+        say(&r.map(|json| json_string(&json, "reply").unwrap_or_default()).unwrap_or_else(|e| e));
+    });
+}
+
+/// Tells the Mac which parts are hidden in the headset (POST /visibility), so the AI knows what the wearer
+/// cannot see. Sent when the set changes; nothing is shown for it.
+pub fn sync_hidden(names: Vec<String>) {
+    std::thread::spawn(move || {
+        let list = names.iter().map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\""))).collect::<Vec<_>>().join(",");
+        let _ = post_typed("/visibility", b"", "text/plain", 10, &format!("X-Hidden: {}\r\n", percent(&format!("[{list}]"))));
+    });
+}
+
+/// Commands the server recognised in a spoken or typed request, for the render loop to run, oldest first.
+static COMMANDS_IN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The next recognised command, if any.
+pub fn take_command() -> Option<String> {
+    let mut q = COMMANDS_IN.lock().ok()?;
+    if q.is_empty() { None } else { Some(q.remove(0)) }
 }
 
 /// A big request is waiting for the wearer's OK (Enter or B to go on, Esc to stop).
 static CONFIRM: AtomicBool = AtomicBool::new(false);
 
 pub fn confirm_pending() -> bool {
-    CONFIRM.load(Ordering::SeqCst)
+    CONFIRM.load(Ordering::SeqCst) || PREVIEW.load(Ordering::SeqCst)
 }
 
-/// Esc: drop the waiting request.
+/// The model on show is a preview: what the last request would give. The design itself is unchanged until
+/// the wearer applies it. The Mac's beacon says so every second, and its answer to the request does at once.
+static PREVIEW: AtomicBool = AtomicBool::new(false);
+
+pub fn preview() -> bool {
+    PREVIEW.load(Ordering::SeqCst)
+}
+
+pub fn set_preview(on: bool) {
+    PREVIEW.store(on, Ordering::SeqCst);
+}
+
+/// Applies (`true`) or drops the change on show.
+fn settle_preview(apply: bool) {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    PREVIEW.store(false, Ordering::SeqCst);
+    set_status(if apply { "Applying..." } else { "Dropping..." }, None, None);
+    std::thread::spawn(move || {
+        match post_typed(if apply { "/preview/apply" } else { "/preview/cancel" }, b"", "text/plain", 120, "") {
+            Ok(json) => {
+                if json.contains("\"changed\": true") {
+                    CHANGES.fetch_add(1, Ordering::SeqCst);
+                }
+                set_status("", None, Some(&json_string(&json, "reply").unwrap_or_default()));
+            }
+            Err(e) => set_status("", None, Some(&e)),
+        }
+        BUSY.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Esc: drop the waiting request, or the change on show.
 pub fn cancel_confirm() {
-    if CONFIRM.swap(false, Ordering::SeqCst) {
+    if PREVIEW.load(Ordering::SeqCst) {
+        settle_preview(false);
+    } else if CONFIRM.swap(false, Ordering::SeqCst) {
         set_status("", None, Some("Stopped: that request was not sent on."));
     }
 }
 
 /// The wearer said OK: the Mac carries on with the request that was waiting.
 pub fn confirm_ai() {
+    if PREVIEW.load(Ordering::SeqCst) {
+        settle_preview(true);
+        return;
+    }
     if !CONFIRM.load(Ordering::SeqCst) || BUSY.swap(true, Ordering::SeqCst) {
         return;
     }
