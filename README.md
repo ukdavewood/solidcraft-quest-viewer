@@ -6,6 +6,10 @@ SC View shows a SolidCraft model in 3D on a Meta Quest 3, over your real room (p
 
 This was written with Claude Code. The guide *Building a Quest 3 viewer for SolidCraft with Claude Code* describes how, step by step, so you can ask Claude to build your own version. This code is what came out of it.
 
+> **Status: frozen sample, no further code releases planned.** This is the code as it was on 17 November 2026. The guide has since moved on (a live link to the normal SolidCraft app, a window onto the Mac screen, an editable timeline and a first Autodesk Fusion version are described there but are **not** in this repository). Treat this as a reference to read and start from, and ask your AI assistant to build your own version from the guide.
+>
+> **Community:** ideas, other platforms, problems and workarounds are welcome as issues, discussions or pull requests, and don't need to be merged to be useful. There is no commitment to review, merge, build or support anything. See the [guide and community notes](https://github.com/ukdavewood/RRF_Claude) and the [demo videos](https://www.youtube.com/playlist?list=PLS769WnSAR1A).
+
 > Unofficial. Not affiliated with or endorsed by the SolidCraft project (`tangency-labs`), Meta or Anthropic. Tested on one Quest 3 and one Mac, with SolidCraft v0.41.0.
 
 ## What is here
