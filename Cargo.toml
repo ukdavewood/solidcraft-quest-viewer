@@ -6,13 +6,20 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+# Linux desktop build, for development without a headset (Monado): cargo run --bin scview-desktop
+[[bin]]
+name = "scview-desktop"
+path = "src/bin/desktop.rs"
 
 [dependencies]
 openxr = { version = "0.19", features = ["loaded"] }
 ash = "0.38"
+log = { version = "0.4", features = ["std"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
-log = "0.4"
 android_logger = "0.14"
 jni-sys = "0.3"
 

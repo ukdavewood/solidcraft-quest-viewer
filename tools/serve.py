@@ -54,6 +54,10 @@ DEFAULT_WHISPER_MODEL = os.environ.get("SCVIEW_WHISPER_MODEL") or os.path.expand
 BEACON_PORT = 47800
 MODEL_EXTS = (".step", ".stp", ".sc", ".obj", ".scm")
 CLAUDE_MODEL = "claude-haiku-5-5"
+# Which AI answers /ask (--ai, --ai-url, --ai-model, --ai-think; or SCVIEW_AI, SCVIEW_AI_URL, SCVIEW_AI_MODEL).
+# "anthropic" is the Claude API; "ollama" is any server that speaks OpenAI's chat completions (Ollama, llama.cpp,
+# LM Studio, vLLM) on this computer or the local network: no key, no cost, nothing leaves the network.
+AI = {"backend": "anthropic", "url": "http://localhost:11434/v1", "model": "qwen3.8:27b", "think": "none", "ctx": 0}
 
 state = {"data": None, "version": None, "name": None, "counter": 0, "source": None, "notes": [], "notes_version": 0}
 lock = threading.Lock()
@@ -234,9 +238,16 @@ def design_summary(focus=()):
 
 
 def api_key():
-    r = subprocess.run(["security", "find-generic-password", "-s", "scview-anthropic", "-w"], capture_output=True,
-                       text=True)
-    return r.stdout.strip() if r.returncode == 0 else None
+    """The Anthropic API key: the macOS Keychain, else the Linux keyring (secret-tool, service scview-anthropic),
+    else ANTHROPIC_API_KEY."""
+    for cmd in (["security", "find-generic-password", "-s", "scview-anthropic", "-w"],
+                ["secret-tool", "lookup", "service", "scview-anthropic"]):
+        if not shutil.which(cmd[0]):
+            continue
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return os.environ.get("ANTHROPIC_API_KEY") or None
 
 
 def claude(key, body):
@@ -248,6 +259,83 @@ def claude(key, body):
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Claude API {e.code}: {e.read()[:300].decode(errors='replace')}")
+
+
+def to_openai(body):
+    """An Anthropic Messages request as an OpenAI chat completions request (text and tool calls only)."""
+    msgs = [{"role": "system", "content": "\n".join(b["text"] for b in body.get("system", []))}]
+    for m in body["messages"]:
+        content = m["content"]
+        if isinstance(content, str):
+            msgs.append({"role": m["role"], "content": content})
+            continue
+        text = "\n".join(c["text"] for c in content if c.get("type") == "text")
+        if m["role"] == "assistant":
+            out = {"role": "assistant", "content": text}
+            calls = [{"id": c["id"], "type": "function",
+                      "function": {"name": c["name"], "arguments": json.dumps(c.get("input") or {})}}
+                     for c in content if c.get("type") == "tool_use"]
+            if calls:
+                out["tool_calls"] = calls
+            msgs.append(out)
+            continue
+        for c in content:  # a user turn: the tool results first, then anything said after them
+            if c.get("type") == "tool_result":
+                r = c.get("content")
+                r = r if isinstance(r, str) else json.dumps(r)
+                msgs.append({"role": "tool", "tool_call_id": c["tool_use_id"],
+                             "content": ("ERROR: " + r) if c.get("is_error") else r})
+        if text:
+            msgs.append({"role": "user", "content": text})
+    out = {"model": AI["model"], "messages": msgs, "max_tokens": body.get("max_tokens", 4000), "stream": False,
+           "tools": [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
+                                                       "parameters": t.get("input_schema", {"type": "object"})}}
+                     for t in body.get("tools", [])]}
+    if (body.get("tool_choice") or {}).get("type") == "none":
+        out["tool_choice"] = "none"
+    if AI["think"]:
+        out["reasoning_effort"] = AI["think"]
+    return out
+
+
+def from_openai(r):
+    """An OpenAI chat completions reply as an Anthropic Messages reply, which is what run_ai() reads."""
+    choice = (r.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = []
+    if (msg.get("content") or "").strip():
+        content.append({"type": "text", "text": msg["content"].strip()})
+    for i, c in enumerate(msg.get("tool_calls") or []):
+        f = c.get("function") or {}
+        a = f.get("arguments")
+        try:
+            a = json.loads(a) if isinstance(a, str) else (a or {})
+        except ValueError:
+            a = {}
+        content.append({"type": "tool_use", "id": c.get("id") or f"call_{uuid.uuid4().hex[:8]}_{i}",
+                        "name": f.get("name", ""), "input": a if isinstance(a, dict) else {}})
+    u = r.get("usage") or {}
+    return {"content": content, "stop_reason": "max_tokens" if choice.get("finish_reason") == "length" else "end_turn",
+            "usage": {"input_tokens": u.get("prompt_tokens"), "output_tokens": u.get("completion_tokens")}}
+
+
+def local_chat(body):
+    """One step with the local model, through the OpenAI-compatible endpoint at AI["url"]."""
+    req = urllib.request.Request(AI["url"].rstrip("/") + "/chat/completions", data=json.dumps(to_openai(body)).encode(),
+                                 headers={"content-type": "application/json",
+                                          "authorization": "Bearer " + (os.environ.get("SCVIEW_AI_KEY") or "ollama")})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return from_openai(json.loads(r.read()))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"local AI {e.code}: {e.read()[:300].decode(errors='replace')}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"The local AI at {AI['url']} does not answer ({e.reason}). Is Ollama running?")
+
+
+def ai_step(key, body):
+    """One step of the AI loop with whichever backend is chosen. Both take and return the Anthropic shapes."""
+    return local_chat(body) if AI["backend"] != "anthropic" else claude(key, body)
 
 
 def tidy_args(name, a):
@@ -451,6 +539,8 @@ def save_spend():
 
 def add_spend(usage):
     """Add one API reply's cost (an estimate from its token counts) to the running total; returns that cost in dollars."""
+    if AI["backend"] != "anthropic":
+        return 0.0  # a local model costs nothing per request
     plain, cread, cwrite = (usage.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
     big = 5.0 if plain + cread + cwrite > 100_000 else 1.0
     cost = big * ((plain + 0.1 * cread + 1.25 * cwrite) * PRICE_IN + (usage.get("output_tokens") or 0) * PRICE_OUT) / 1e6
@@ -691,6 +781,112 @@ def resolve_edge(body_name, start, mid, end, length):
 pending = {"st": None}
 
 
+# --- direct edits: parameters and feature dimensions set without the AI ---
+# Every way in (a spoken or typed request, the panel's /dimension, later a slider or a grabbed handle) ends at
+# set_dimension(), so they all behave the same, share one undo, and cost nothing.
+
+def key_of(text):
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def dimensions():
+    """Everything that can be set directly: user parameters (by name) and feature inputs ("Hole1 Diameter"),
+    as {"id", "label", "value", "unit", "expression", "kind", "feature", "input"}."""
+    text, err = session.call("execute", {"command": "parameters.list", "params": {"filter": "all"}})
+    if err:
+        raise RuntimeError(text[:200])
+    out = []
+    for q in json.loads(text).get("parameters", []):
+        feature, inp = q.get("feature"), q.get("input")
+        label = q["name"] if q.get("source") == "user" or not (feature and inp) else f"{feature} {inp}"
+        out.append({"id": q["name"], "label": label, "value": q.get("display_value", q.get("value")), "unit": q.get("unit") or "",
+                    "expression": str(q.get("expression", "")), "kind": q.get("source", ""), "feature": feature, "input": inp})
+    return out
+
+
+FILLER = {"the", "of", "a", "an", "s", "my", "its", "value", "parameter", "dimension"}
+
+
+def find_dimension(words, dims):
+    """The one dimension the words name, else None (two candidates is None: the AI can ask or work it out).
+    Tried in order: the exact name or label; the only input called that ("diameter"); the only label that has
+    every word ("hole diameter" for "Hole1 Diameter", "hole" when Hole1 has a single input)."""
+    k = key_of(words)
+    if not k:
+        return None
+    for test in (lambda d: k in (key_of(d["id"]), key_of(d["label"])),
+                 lambda d: d["input"] and k == key_of(d["input"])):
+        hits = [d for d in dims if test(d)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            return None
+    toks = [t for t in re.sub(r"[^a-z0-9_ ]+", " ", words.lower()).split() if t not in FILLER]
+    hits = [d for d in dims if toks and all(key_of(t) in key_of(d["label"]) for t in toks)]
+    return hits[0] if len(hits) == 1 else None
+
+
+NUM = r"(?P<val>-?\d+(?:\.\d+)?)\s*(?P<unit>mm|millimet(?:er|re)s?|cm|centimet(?:er|re)s?|in|inch(?:es)?|deg|degrees?)?"
+DIRECT_SET = re.compile(r"^(?:(?:set|change|make|put)\s+)?(?P<name>.+?)\s*(?:\bto\b|=|\bequals\b|\bequal to\b|\bat\b)\s*" + NUM + "$")
+DIRECT_BARE = re.compile(r"^(?:(?:set|change|make|put)\s+)?(?P<name>.+?)\s+" + NUM + "$")
+DIRECT_REL = re.compile(r"^(?P<verb>increase|raise|grow|decrease|lower|reduce|shrink)\s+(?P<name>.+?)\s+by\s+" + NUM + "$")
+UNITS = {"mm": "", "millimeter": "", "millimetre": "", "cm": " cm", "centimeter": " cm", "centimetre": " cm", "in": " in",
+         "inch": " in", "inche": " in", "deg": " deg", "degree": " deg"}
+
+
+def set_dimension(dim, value, why=""):
+    """Set one dimension (a number in its own unit, or an expression). (reply, changed). A value that breaks
+    a feature is taken back."""
+    before = undo_depth()
+    text, err = session.call("set_parameter", {"name": dim["id"], "value": value})
+    log(f"direct: {dim['label']} ({dim['id']}) = {value!r}{why} -> {'ERROR ' if err else ''}{text[:160]}")
+    if err:
+        return f"SolidCraft refused {dim['label']} = {value}: {text[:120]}", False
+    r = json.loads(text)
+    if r.get("errors"):
+        session.call("undo", {})
+        shown = f"{value:g}" if isinstance(value, float) else value
+        return f"{dim['label']} = {shown} breaks {len(r['errors'])} feature(s), so I put it back.", False
+    ai_redo.clear()
+    if before is not None:
+        ai_undo.append((before, f"{dim['label']} = {value:g}" if isinstance(value, float) else f"{dim['label']} = {value}"))
+    unit = f" {dim['unit']}" if dim["unit"] else ""
+    return f"{dim['label']} is now {r.get('display_value', value):g}{unit} (was {dim['value']:g}).", True
+
+
+def direct_request(text):
+    """A request that only sets one dimension ("set thickness to 12", "plate_w = 80", "hole diameter 8 mm",
+    "increase thickness by 2") is done here, with no AI: (reply, changed). Anything else returns None."""
+    t = re.sub(r"\s+", " ", text.lower().strip(" .!?,"))
+    t = re.sub(r"^(?:please|can you|could you)\s+", "", t)
+    m = DIRECT_REL.match(t) or DIRECT_SET.match(t) or DIRECT_BARE.match(t)
+    if not m:
+        return None
+    try:
+        dim = find_dimension(re.sub(r"^the\s+", "", m["name"]), dimensions())
+    except (RuntimeError, ValueError):
+        return None
+    if dim is None:
+        return None
+    val, unit = float(m["val"]), UNITS.get((m["unit"] or "mm").rstrip("s"), "")
+    if "verb" in m.groupdict() and m["verb"]:
+        if unit or not isinstance(dim["value"], (int, float)):
+            return None  # a change by so much in another unit: leave it to the AI
+        val = dim["value"] + (val if m["verb"] in ("increase", "raise", "grow") else -val)
+    value = f"{val:g}{unit}" if unit else val
+    return set_dimension(dim, value, " (spoken)")
+
+
+def dimensions_text():
+    """For the headset, one dimension per line: id, label, value, unit, kind (user/feature/sketch), expression."""
+    if session is None:
+        return b""
+    try:
+        return "".join(f"{d['id']}\t{d['label']}\t{d['value']}\t{d['unit']}\t{d['kind']}\t{d['expression']}\n" for d in dimensions()).encode()
+    except (RuntimeError, ValueError):
+        return b""
+
+
 def est_tokens(obj):
     """Rough size of a request in tokens (about 4 characters each)."""
     return len(json.dumps(obj)) // 4
@@ -699,9 +895,10 @@ def est_tokens(obj):
 def ask(request_text, selected=(), pointed=None, faces=(), allow_confirm=True, edges=()):
     """Run one request through Claude with the session's tools; returns (reply, changed). When the context grows
     past --context-confirm the request waits (pending["st"] is set) for /ask/confirm; past --context-max it stops."""
-    key = api_key()
+    key = api_key() if AI["backend"] == "anthropic" else "local"
     if not key:
-        return "No API key: run  security add-generic-password -a \"$USER\" -s scview-anthropic -w  on the Mac.", False
+        return ("No API key: run  security add-generic-password -a \"$USER\" -s scview-anthropic -w  on a Mac, or "
+                "secret-tool store --label scview service scview-anthropic  on Linux."), False
     tools = [{"name": n, "description": session.tools[n].get("description", "")[:1500],
               "input_schema": session.tools[n].get("inputSchema", {"type": "object"})} for n in AI_TOOLS
              if n in session.tools]
@@ -812,11 +1009,14 @@ def run_ai(st):
             pending["st"] = st
             log(f"  context ~{size} tokens is over {args.context_confirm}: waiting for the wearer's OK")
             return f"Big request: about {size // 1000}k tokens.", changed
-        reply = claude(key, body)
+        reply = ai_step(key, body)
         u = reply.get("usage", {})
         st["cost"] = st.get("cost", 0.0) + add_spend(u)
         log(f"  step {step}: context ~{size // 1000}k tokens (API: input {u.get('input_tokens')}, cached read "
             f"{u.get('cache_read_input_tokens')}, written {u.get('cache_creation_input_tokens')}, output {u.get('output_tokens')})")
+        if AI["backend"] != "anthropic" and AI["ctx"] and (u.get("input_tokens") or 0) > 0.9 * AI["ctx"]:
+            log(f"  WARNING: the prompt ({u.get('input_tokens')} tokens) is close to the model's context window "
+                f"({AI['ctx']}): the server may be cutting it. Raise the window (Ollama: OLLAMA_CONTEXT_LENGTH).")
         messages.append({"role": "assistant", "content": reply["content"]})
         uses = [c for c in reply["content"] if c.get("type") == "tool_use"]
         if reply.get("stop_reason") == "max_tokens":
@@ -894,8 +1094,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorised():
             return
-        if self.path in ("/comments.txt", "/models.txt", "/requests.txt"):
-            out = {"/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text}[self.path]()
+        if self.path in ("/comments.txt", "/models.txt", "/requests.txt", "/dimensions.txt"):
+            out = {"/comments.txt": notes_text, "/models.txt": models_text, "/requests.txt": requests_text,
+                   "/dimensions.txt": dimensions_text}[self.path]()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(out)))
@@ -926,7 +1127,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authorised():
             return
         if self.path not in ("/ask", "/transcribe", "/undo", "/redo", "/pushpull", "/comment", "/comment/delete", "/comment/restore", "/comment/do",
-                             "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture"):
+                             "/comment/edit", "/model/open", "/ask/confirm", "/requests/save", "/requests/delete", "/save", "/capture", "/dimension"):
             self.send_error(404)
             return
         if self.path == "/model/open":
@@ -1021,6 +1222,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (ValueError, IndexError) as e:
                 reply = f"Bad push/pull request: {e}"
             except RuntimeError as e:
+                reply = str(e)
+            self.reply_json({"heard": "", "reply": reply, "ok": changed, "changed": changed})
+            return
+        if self.path == "/dimension":
+            # Set one parameter or feature dimension from the headset (a slider, a handle, a typed number), no AI.
+            # X-Name: its id or label from /dimensions.txt (percent-encoded); X-Value: a number or an expression.
+            reply, changed = "", False
+            try:
+                if session is None:
+                    raise RuntimeError("Changing dimensions needs a STEP or .sc source (this one is view only).")
+                name = urllib.parse.unquote(self.headers.get("X-Name", ""))
+                raw = urllib.parse.unquote(self.headers.get("X-Value", "")).strip()
+                dim = find_dimension(name, dimensions())
+                if dim is None:
+                    raise RuntimeError(f"No single dimension is called \"{name}\".")
+                if not raw:
+                    raise RuntimeError("No value.")
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = raw
+                reply, changed = set_dimension(dim, value, " (panel)")
+                if changed:
+                    export_scm()
+            except (RuntimeError, ValueError) as e:
                 reply = str(e)
             self.reply_json({"heard": "", "reply": reply, "ok": changed, "changed": changed})
             return
@@ -1214,14 +1440,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if self.headers.get("X-Replay") and not pointed and not faces and not edges:
                     entry = find_entry(heard)
                     replayed = replay(entry, selected) if entry else None
-                if replayed:
-                    reply, changed = replayed
+                # A request that only sets a dimension needs no AI. set_dimension() keeps its own undo step.
+                done = None if (replayed or args.no_direct) else direct_request(heard)
+                if done:
+                    reply, changed = done
+                    if changed:
+                        export_scm()
+                    remember(heard, reply, None, changed, selected)
                 else:
-                    reply, changed = ask(heard, selected, pointed, faces, edges=edges)
-                    learn(heard, last_ai["st"], changed)
-                if not pending["st"]:
-                    remember(heard, reply, None if replayed else last_ai["st"], changed, selected)
-                finish_ai(heard, before, changed)
+                    if replayed:
+                        reply, changed = replayed
+                    else:
+                        reply, changed = ask(heard, selected, pointed, faces, edges=edges)
+                        learn(heard, last_ai["st"], changed)
+                    if not pending["st"]:
+                        remember(heard, reply, None if replayed else last_ai["st"], changed, selected)
+                    finish_ai(heard, before, changed)
                 ok = True
         except Exception as e:
             reply = str(e)
@@ -1468,10 +1702,25 @@ def main():
                     help="an AI request is stopped when it grows past this many tokens (default 120000)")
     ap.add_argument("--balance", type=float,
                     help="your API credit in dollars: the headset then shows what is left, estimated from what this server spends")
+    ap.add_argument("--no-direct", action="store_true",
+                    help="send every request to the AI, even one that only sets a parameter or dimension")
+    ap.add_argument("--ai", choices=["anthropic", "ollama"], default=os.environ.get("SCVIEW_AI") or "anthropic",
+                    help="who answers voice requests: the Claude API (default), or a local model behind an "
+                         "OpenAI-compatible endpoint (Ollama, llama.cpp, LM Studio)")
+    ap.add_argument("--ai-url", default=os.environ.get("SCVIEW_AI_URL") or AI["url"],
+                    help="the local endpoint (default http://localhost:11434/v1)")
+    ap.add_argument("--ai-model", default=os.environ.get("SCVIEW_AI_MODEL") or AI["model"],
+                    help="the local model, which must support tool calling (default qwen3.8:27b)")
+    ap.add_argument("--ai-think", default=os.environ.get("SCVIEW_AI_THINK") or AI["think"],
+                    help="reasoning_effort sent to the local model: none (fastest, default), low, medium, high; "
+                         "empty sends nothing")
+    ap.add_argument("--ai-ctx", type=int, default=0,
+                    help="the local model's context window in tokens, to be warned when a request nears it")
     ap.add_argument("--models", action="append",
                     default=[],
                     help="another folder for the headset's Models list (repeatable)")
     args = ap.parse_args()
+    AI.update(backend=args.ai, url=args.ai_url, model=args.ai_model, think=args.ai_think, ctx=args.ai_ctx)
     global ACCESS_CODE
     if not args.no_auth:
         ACCESS_CODE = load_access_code()
@@ -1494,7 +1743,9 @@ def main():
         log(f"access code for the headset: {ACCESS_CODE}  (kept in {os.path.join(SCV_DIR, 'token')})")
     else:
         log("WARNING: --no-auth: anyone on the network can use this server")
-    if not args.no_ai and not api_key():
+    if AI["backend"] != "anthropic":
+        log(f"AI: local model {AI['model']} at {AI['url']} (no key, no cost)")
+    elif not args.no_ai and not api_key():
         log("note: no Keychain item 'scview-anthropic' yet, so voice requests will be refused")
 
     seen = None

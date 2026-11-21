@@ -7,6 +7,7 @@
 //! `adb shell pm grant org.scview.viewer android.permission.RECORD_AUDIO`.
 
 use std::io::{Read, Write};
+#[cfg(target_os = "android")]
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -311,11 +312,14 @@ fn set_status(state: &str, heard: Option<&str>, reply: Option<&str>) {
     }
 }
 
+#[cfg(target_os = "android")]
 #[allow(non_camel_case_types)]
 type AAudioStreamBuilder = c_void;
+#[cfg(target_os = "android")]
 #[allow(non_camel_case_types)]
 type AAudioStream = c_void;
 
+#[cfg(target_os = "android")]
 #[link(name = "aaudio")]
 extern "C" {
     fn AAudio_createStreamBuilder(builder: *mut *mut AAudioStreamBuilder) -> i32;
@@ -333,7 +337,9 @@ extern "C" {
     fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32;
 }
 
+#[cfg(target_os = "android")]
 const AAUDIO_DIRECTION_INPUT: i32 = 1;
+#[cfg(target_os = "android")]
 const AAUDIO_FORMAT_PCM_I16: i32 = 1;
 const RATE: u32 = 16_000;
 
@@ -407,7 +413,54 @@ pub fn update(held: bool) {
     }
 }
 
+/// Desktop: records the default microphone with PipeWire's `pw-record` until the button is released.
+#[cfg(not(target_os = "android"))]
+fn record() -> Result<Vec<i16>, String> {
+    let mut child = std::process::Command::new("pw-record")
+        .args(["--rate", &RATE.to_string(), "--channels", "1", "--format", "s16", "--raw", "-"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("microphone: pw-record did not start ({e})"))?;
+    let Some(mut out) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err("microphone: no pw-record output".into());
+    };
+    log::info!("voice: recording at {RATE} Hz with pw-record");
+    if let Ok(mut p) = PCM.lock() {
+        p.1 = RATE;
+    }
+    let mut pcm: Vec<i16> = Vec::new();
+    let mut buf = [0u8; 3200];
+    let mut odd: Option<u8> = None;
+    let max = RATE as usize * 30;
+    while RECORDING.load(Ordering::SeqCst) && pcm.len() < max {
+        let n = match out.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let start = pcm.len();
+        let mut bytes: Vec<u8> = odd.take().into_iter().collect();
+        bytes.extend_from_slice(&buf[..n]);
+        if bytes.len() % 2 == 1 {
+            odd = bytes.pop();
+        }
+        pcm.extend(bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+        if let Ok(mut p) = PCM.lock() {
+            p.0.extend_from_slice(&pcm[start..]);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    log::info!("voice: {:.1} s recorded", pcm.len() as f32 / RATE as f32);
+    if pcm.len() < RATE as usize / 4 {
+        return Err("Too short: hold the left trigger while you speak.".into());
+    }
+    Ok(pcm)
+}
+
 /// Records until the button is released; 16 kHz mono samples.
+#[cfg(target_os = "android")]
 fn record() -> Result<Vec<i16>, String> {
     // SAFETY: plain AAudio C calls; the builder and stream pointers come from AAudio and are released here.
     unsafe {

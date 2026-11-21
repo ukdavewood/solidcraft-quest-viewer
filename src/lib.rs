@@ -7,7 +7,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
+#[cfg(target_os = "android")]
+use android_activity::{AndroidApp as Host, InputStatus, MainEvent, PollEvent};
+#[cfg(target_os = "android")]
+use android_activity::input::Keycode;
+#[cfg(not(target_os = "android"))]
+mod host;
+#[cfg(not(target_os = "android"))]
+pub use host::Host;
+#[cfg(not(target_os = "android"))]
+use host::Keycode;
 use ash::{
     util::read_spv,
     vk::{self, Handle},
@@ -1561,7 +1570,7 @@ fn ray_box_mesh() -> (Vec<u8>, Vec<u32>) {
 const VERTEX_SIZE: usize = 28;
 
 /// The folders the model files are looked for in.
-fn data_dirs(app: &AndroidApp) -> Vec<std::path::PathBuf> {
+fn data_dirs(app: &Host) -> Vec<std::path::PathBuf> {
     [app.external_data_path(), app.internal_data_path()].into_iter().flatten().collect()
 }
 
@@ -1613,7 +1622,7 @@ fn parse_scm(b: &[u8]) -> Result<Mesh, String> {
 }
 
 /// Reads `sea.scm` from the app's files folder (pushed by adb, or saved from the last Wi-Fi download).
-fn load_scm(app: &AndroidApp) -> Option<Mesh> {
+fn load_scm(app: &Host) -> Option<Mesh> {
     for d in data_dirs(app) {
         let path = d.join("sea.scm");
         let Ok(b) = std::fs::read(&path) else { continue };
@@ -1785,7 +1794,7 @@ fn stl_mesh(stl: &[u8], tris: usize) -> Mesh {
 }
 
 /// Reads a binary STL: returns the file bytes (80-byte header, u32 count, 50-byte records) and the triangle count.
-fn load_stl(app: &AndroidApp) -> Option<(Vec<u8>, usize)> {
+fn load_stl(app: &Host) -> Option<(Vec<u8>, usize)> {
     let mut dirs = Vec::new();
     if let Some(p) = app.external_data_path() {
         dirs.push(p);
@@ -1813,16 +1822,25 @@ fn load_stl(app: &AndroidApp) -> Option<(Vec<u8>, usize)> {
 /// runtime fills logcat so fast that events from a few minutes ago are gone. Pull it with
 /// `adb pull /sdcard/Android/data/org.scview.viewer/files/scview.log`.
 struct FileLogger {
+    #[cfg(target_os = "android")]
     android: android_logger::AndroidLogger,
     file: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 impl log::Log for FileLogger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        self.android.enabled(m)
+        #[cfg(target_os = "android")]
+        return self.android.enabled(m);
+        #[cfg(not(target_os = "android"))]
+        return m.level() <= log::Level::Info;
     }
     fn log(&self, r: &log::Record) {
+        #[cfg(target_os = "android")]
         self.android.log(r);
+        #[cfg(not(target_os = "android"))]
+        if self.enabled(r.metadata()) {
+            eprintln!("[{}] {}", r.level(), r.args());
+        }
         if let Ok(mut guard) = self.file.lock() {
             if let Some(f) = guard.as_mut() {
                 use std::io::Write;
@@ -1853,14 +1871,15 @@ struct Mouse {
 
 /// A key pressed on the keyboard: its code, the character it types, and Ctrl / Shift.
 struct KeyPress {
-    code: android_activity::input::Keycode,
+    code: Keycode,
     ch: Option<char>,
     ctrl: bool,
     shift: bool,
 }
 
 /// Takes one input event into the mouse state or the key list.
-fn read_input(app: &AndroidApp, ev: &android_activity::input::InputEvent, mouse: &mut Mouse, keys: &mut Vec<KeyPress>) {
+#[cfg(target_os = "android")]
+fn read_input(app: &Host, ev: &android_activity::input::InputEvent, mouse: &mut Mouse, keys: &mut Vec<KeyPress>) {
     use android_activity::input::{Axis, InputEvent, KeyAction, KeyMapChar, MotionAction, Source};
     match ev {
         InputEvent::KeyEvent(k) if k.action() == KeyAction::Down => {
@@ -1901,7 +1920,11 @@ fn read_input(app: &AndroidApp, ev: &android_activity::input::InputEvent, mouse:
 }
 
 /// Asks Android for the permissions the app needs (the microphone, and the room scan) that it does not have yet.
-fn request_permissions(app: &AndroidApp) {
+#[cfg(not(target_os = "android"))]
+fn request_permissions(_app: &Host) {}
+
+#[cfg(target_os = "android")]
+fn request_permissions(app: &Host) {
     use jni_sys::{jobject, jvalue, JNIEnv, JavaVM, JNI_OK};
     // SAFETY: plain JNI calls on the activity object android-activity gives us; local references
     // are dropped before returning, and any Java exception is cleared.
@@ -1969,7 +1992,11 @@ fn request_permissions(app: &AndroidApp) {
 
 /// Asks Android for the mouse (pointer capture, `on`) or gives it back. Captured, it cannot leave the
 /// app's window and every move arrives as a relative event. Only works while the app has focus.
-fn pointer_capture(app: &AndroidApp, on: bool) {
+#[cfg(not(target_os = "android"))]
+fn pointer_capture(_app: &Host, _on: bool) {}
+
+#[cfg(target_os = "android")]
+fn pointer_capture(app: &Host, on: bool) {
     use jni_sys::{jobject, jvalue, JNIEnv, JavaVM, JNI_OK};
     // SAFETY: plain JNI calls on the activity object android-activity gives us; local references
     // are dropped before returning, and any Java exception is cleared.
@@ -2027,7 +2054,7 @@ fn pointer_capture(app: &AndroidApp, on: bool) {
     }
 }
 
-fn init_logging(app: &AndroidApp) {
+fn init_logging(app: &Host) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let file = data_dirs(app).into_iter().next().and_then(|d| {
@@ -2039,6 +2066,7 @@ fn init_logging(app: &AndroidApp) {
             std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
         });
         let logger = FileLogger {
+            #[cfg(target_os = "android")]
             android: android_logger::AndroidLogger::new(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("SCVIEW")),
             file: std::sync::Mutex::new(file),
         };
@@ -2048,8 +2076,9 @@ fn init_logging(app: &AndroidApp) {
     });
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
-fn android_main(app: AndroidApp) {
+fn android_main(app: Host) {
     init_logging(&app);
     log::info!("--- start (UTC times) ---");
     std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
@@ -2057,7 +2086,19 @@ fn android_main(app: AndroidApp) {
     log::info!("exiting");
 }
 
-fn run(app: &AndroidApp) {
+/// The desktop entry point (`scview-desktop`): the same app on Linux, against the OpenXR runtime
+/// chosen by `XR_RUNTIME_JSON` (Monado's simulated headset for development without a Quest).
+#[cfg(not(target_os = "android"))]
+pub fn desktop_main() {
+    let host = Host::new();
+    init_logging(&host);
+    log::info!("--- start, desktop (UTC times); files in {:?} ---", host.external_data_path());
+    std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
+    run(&host);
+    log::info!("exiting");
+}
+
+fn run(app: &Host) {
     // The model: sea.scm (coloured), else a binary STL, else one triangle.
     let mesh = load_scm(app).unwrap_or_else(|| {
         let (stl, tris) = load_stl(app).unwrap_or_else(|| {
@@ -2080,12 +2121,16 @@ fn run(app: &AndroidApp) {
     }
 
     let entry = unsafe { xr::Entry::load().expect("OpenXR loader (libopenxr_loader.so) not found") };
+    #[cfg(target_os = "android")]
     entry.initialize_android_loader().unwrap();
     let available = entry.enumerate_extensions().unwrap();
     assert!(available.khr_vulkan_enable2);
     let mut enabled = xr::ExtensionSet::default();
     enabled.khr_vulkan_enable2 = true;
-    enabled.khr_android_create_instance = true;
+    #[cfg(target_os = "android")]
+    {
+        enabled.khr_android_create_instance = true;
+    }
     // Passthrough (the room seen through the headset cameras) behind the model, where available.
     enabled.fb_passthrough = available.fb_passthrough;
     log::info!("XR_FB_passthrough available: {}", available.fb_passthrough);
@@ -2098,7 +2143,10 @@ fn run(app: &AndroidApp) {
     // cannot tie the app's frames to its window ("non-Activity Context", aperture from "random")
     // and shows its loading scene instead of the app.
     let xr_instance = unsafe {
+        #[cfg(target_os = "android")]
         let mut names: Vec<&[u8]> = vec![b"XR_KHR_vulkan_enable2\0", b"XR_KHR_android_create_instance\0"];
+        #[cfg(not(target_os = "android"))]
+        let mut names: Vec<&[u8]> = vec![b"XR_KHR_vulkan_enable2\0"];
         if enabled.fb_passthrough {
             names.push(b"XR_FB_passthrough\0");
         }
@@ -2107,6 +2155,7 @@ fn run(app: &AndroidApp) {
             names.push(b"XR_META_environment_raycast\0");
         }
         let ptrs: Vec<*const std::os::raw::c_char> = names.iter().map(|n| n.as_ptr() as *const _).collect();
+        #[cfg(target_os = "android")]
         let android_info = xr::sys::InstanceCreateInfoAndroidKHR {
             ty: xr::sys::InstanceCreateInfoAndroidKHR::TYPE,
             next: std::ptr::null(),
@@ -2115,7 +2164,10 @@ fn run(app: &AndroidApp) {
         };
         let mut info = xr::sys::InstanceCreateInfo {
             ty: xr::sys::InstanceCreateInfo::TYPE,
+            #[cfg(target_os = "android")]
             next: &android_info as *const _ as *const _,
+            #[cfg(not(target_os = "android"))]
+            next: std::ptr::null(),
             create_flags: Default::default(),
             application_info: xr::sys::ApplicationInfo {
                 application_name: [0; xr::sys::MAX_APPLICATION_NAME_SIZE],
@@ -2516,6 +2568,30 @@ fn run(app: &AndroidApp) {
             if let Err(e) = xr_instance.suggest_interaction_profile_bindings(p("/interaction_profiles/oculus/touch_controller"), &bindings) {
                 log::info!("controller bindings: {e:?}");
             }
+            // Desktop: Monado's keyboard-and-mouse controllers are Mixed Reality controllers (no A, B, X, Y):
+            // the menu button recentres.
+            #[cfg(not(target_os = "android"))]
+            {
+                let wmr = [
+                    xr::Binding::new(&grip_pose, p("/user/hand/left/input/grip/pose")),
+                    xr::Binding::new(&grip_pose, p("/user/hand/right/input/grip/pose")),
+                    xr::Binding::new(&squeeze, p("/user/hand/left/input/squeeze/click")),
+                    xr::Binding::new(&squeeze, p("/user/hand/right/input/squeeze/click")),
+                    xr::Binding::new(&stick, p("/user/hand/left/input/thumbstick")),
+                    xr::Binding::new(&stick, p("/user/hand/right/input/thumbstick")),
+                    xr::Binding::new(&recentre, p("/user/hand/left/input/menu/click")),
+                    xr::Binding::new(&recentre, p("/user/hand/right/input/menu/click")),
+                    xr::Binding::new(&aim_pose, p("/user/hand/left/input/aim/pose")),
+                    xr::Binding::new(&aim_pose, p("/user/hand/right/input/aim/pose")),
+                    xr::Binding::new(&trigger, p("/user/hand/left/input/trigger/value")),
+                    xr::Binding::new(&trigger, p("/user/hand/right/input/trigger/value")),
+                    xr::Binding::new(&stick_click, p("/user/hand/left/input/thumbstick/click")),
+                    xr::Binding::new(&stick_click, p("/user/hand/right/input/thumbstick/click")),
+                ];
+                if let Err(e) = xr_instance.suggest_interaction_profile_bindings(p("/interaction_profiles/microsoft/motion_controller"), &wmr) {
+                    log::info!("desktop controller bindings: {e:?}");
+                }
+            }
         }
         session.attach_action_sets(&[&action_set]).unwrap();
         let hand_spaces: Vec<xr::Space> = hand_paths.iter().map(|&h| grip_pose.create_space(session.clone(), h, xr::Posef::IDENTITY).unwrap()).collect();
@@ -2596,7 +2672,9 @@ fn run(app: &AndroidApp) {
         let mut exit_requested = false;
         let mut no_render = 0u32;
         let mut total: u64 = 0;
-        let mut resumed = false;
+        // The desktop has no Android lifecycle: always resumed.
+        #[cfg_attr(not(target_os = "android"), allow(unused_mut))]
+        let mut resumed = cfg!(not(target_os = "android"));
         let mut ready = false;
 
         request_permissions(app);
@@ -2622,6 +2700,17 @@ fn run(app: &AndroidApp) {
         let mut pp_acc = 0.0f32;
         let mut pp_wheel_until: Option<Instant> = None;
         'main: loop {
+            #[cfg(not(target_os = "android"))]
+            {
+                if app.quit_requested() {
+                    destroy = true;
+                }
+                (mouse.dx, mouse.dy, mouse.wheel) = (0.0, 0.0, 0.0);
+                for (code, ch, ctrl, shift) in app.take_keys() {
+                    keys.push(KeyPress { code, ch, ctrl, shift });
+                }
+            }
+            #[cfg(target_os = "android")]
             app.poll_events(Some(Duration::ZERO), |e| {
                 match &e {
                     PollEvent::Main(MainEvent::Destroy) => destroy = true,
@@ -2638,8 +2727,13 @@ fn run(app: &AndroidApp) {
             });
             // Input events: the keyboard and mouse (Bluetooth, paired with the headset); everything is
             // read, so the system does not decide the app has stopped responding.
-            (mouse.dx, mouse.dy, mouse.wheel) = (0.0, 0.0, 0.0);
+            #[cfg(target_os = "android")]
+            {
+                (mouse.dx, mouse.dy, mouse.wheel) = (0.0, 0.0, 0.0);
+            }
+            #[cfg(target_os = "android")]
             let mut mouse_seen = false;
+            #[cfg(target_os = "android")]
             if let Ok(mut it) = app.input_events_iter() {
                 while it.next(|ev| {
                     if let android_activity::input::InputEvent::MotionEvent(_) = ev {
@@ -2651,6 +2745,7 @@ fn run(app: &AndroidApp) {
             }
             // The mouse is in use but not ours: ask for it (at most every 2 s).
             // (Not only after a mouse event: none arrive until the app has the mouse.)
+            #[cfg(target_os = "android")]
             let _ = mouse_seen;
             if !mouse.captured && mouse.want_capture && mouse.asked.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) {
                 mouse.asked = Some(Instant::now());
@@ -3345,7 +3440,7 @@ fn run(app: &AndroidApp) {
             // typed gives the mouse back to the system.
             let mut key_btn: Option<Button> = None;
             for k in keys.drain(..) {
-                use android_activity::input::Keycode as K;
+                use crate::Keycode as K;
                 let Ok(mut typed) = voice::TYPED.lock() else { continue };
                 if k.ctrl {
                     key_btn = match k.code {
